@@ -21,6 +21,8 @@ pub struct Config {
     pub revive_range: f64,
     /// Ticks of bleeding a hit on a downed player costs, per health point.
     pub penalty_ticks_per_hp: f32,
+    /// The most ticks a single hit on a downed player can cost.
+    pub penalty_cap_ticks: u32,
 }
 
 impl Default for Config {
@@ -29,13 +31,75 @@ impl Default for Config {
             bleed_ticks: 60 * 20,
             revive_ticks: 5 * 20,
             revive_range: 2.5,
-            penalty_ticks_per_hp: 20.0,
+            penalty_ticks_per_hp: 10.0,
+            penalty_cap_ticks: 10 * 20,
         }
     }
 }
 
+impl Config {
+    /// The config file's form, in seconds and blocks.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "bleed_seconds": self.bleed_ticks as f64 / 20.0,
+            "revive_seconds": self.revive_ticks as f64 / 20.0,
+            "revive_range": self.revive_range,
+            "penalty_seconds_per_hp": self.penalty_ticks_per_hp as f64 / 20.0,
+            "penalty_cap_seconds": self.penalty_cap_ticks as f64 / 20.0,
+        })
+    }
+
+    /// Reads `to_json`'s form; a missing or bad field keeps its default.
+    pub fn from_json(value: &Value) -> Self {
+        let mut c = Self::default();
+        let num = |key: &str| value.get(key).and_then(Value::as_f64).filter(|v| v.is_finite() && *v >= 0.0);
+        let ticks = |s: f64| (s * 20.0).round().min(u32::MAX as f64) as u32;
+        if let Some(v) = num("bleed_seconds") {
+            c.bleed_ticks = ticks(v).max(1);
+        }
+        if let Some(v) = num("revive_seconds") {
+            c.revive_ticks = ticks(v).max(1);
+        }
+        if let Some(v) = num("revive_range") {
+            c.revive_range = v;
+        }
+        if let Some(v) = num("penalty_seconds_per_hp") {
+            c.penalty_ticks_per_hp = (v * 20.0) as f32;
+        }
+        if let Some(v) = num("penalty_cap_seconds") {
+            c.penalty_cap_ticks = ticks(v);
+        }
+        c
+    }
+}
+
+/// Vanilla's `CombatRules.getDamageAfterAbsorb`: what is left of `damage`
+/// after `armor` points and `toughness`. Enchantments and Resistance are
+/// left out, so it errs towards downing.
+pub fn after_armor(damage: f32, armor: f32, toughness: f32) -> f32 {
+    let toughness = toughness.max(0.0);
+    let reduce = (armor - damage / (2.0 + toughness / 4.0)).clamp(armor * 0.2, 20.0);
+    damage * (1.0 - reduce / 25.0)
+}
+
 /// Damage types a teammate couldn't save anyone from: they kill as usual.
 pub const UNSAVABLE: [&str; 2] = ["minecraft:out_of_world", "minecraft:generic_kill"];
+
+/// Damage types armour doesn't reduce (vanilla's `#bypasses_armor`).
+pub const ARMOR_IGNORED: [&str; 12] = [
+    "minecraft:on_fire",
+    "minecraft:in_wall",
+    "minecraft:cramming",
+    "minecraft:drown",
+    "minecraft:fly_into_wall",
+    "minecraft:freeze",
+    "minecraft:starve",
+    "minecraft:fall",
+    "minecraft:stalagmite",
+    "minecraft:magic",
+    "minecraft:indirect_magic",
+    "minecraft:wither",
+];
 
 /// A player on the server, as the glue reads them each tick.
 #[derive(Clone, Debug, PartialEq)]
@@ -51,6 +115,9 @@ pub struct PlayerView {
     /// 0 survival, 1 creative, 2 adventure, 3 spectator.
     pub game_mode: i32,
     pub sneaking: bool,
+    /// Armour points and toughness worn, as last read (0 when unknown).
+    pub armor: f32,
+    pub toughness: f32,
 }
 
 impl PlayerView {
@@ -104,6 +171,8 @@ pub struct Revive {
     /// From the last tick, lowered by the hits since: each mortal player's
     /// health.
     health: HashMap<u128, f32>,
+    /// From the last tick: each player's armour points and toughness.
+    armor: HashMap<u128, (f32, f32)>,
     /// Players on and present last tick.
     present: HashSet<u128>,
     tick: u64,
@@ -142,7 +211,8 @@ impl Revive {
         let amount = if amount.is_finite() { amount.max(0.0) } else { f32::MAX };
         if let Some(d) = self.downed.get_mut(&uuid) {
             // Hits on a downed player shorten their time instead.
-            let penalty = (amount * self.config.penalty_ticks_per_hp).min(u32::MAX as f32) as u32;
+            let penalty = (amount * self.config.penalty_ticks_per_hp)
+                .min(self.config.penalty_cap_ticks as f32) as u32;
             d.left = d.left.saturating_sub(penalty);
             return true;
         }
@@ -158,8 +228,15 @@ impl Revive {
         if health <= 0.0 {
             return false;
         }
-        // The amount is before armour and enchantments: a hit that might
-        // kill counts as one that does.
+        // The amount is before armour: take the worn armour off, as vanilla
+        // will. Enchantments and Resistance are left out, so a hit that
+        // might kill still counts as one that does.
+        let (armor, toughness) = self.armor.get(&uuid).copied().unwrap_or((0.0, 0.0));
+        let amount = if amount == f32::MAX || ARMOR_IGNORED.contains(&damage_type) {
+            amount
+        } else {
+            after_armor(amount, armor, toughness)
+        };
         if amount >= health && self.helper_for(uuid) {
             self.pending.push(uuid);
             return true;
@@ -191,6 +268,10 @@ impl Revive {
             .iter()
             .filter(|p| p.mortal())
             .map(|p| (p.uuid, p.health))
+            .collect();
+        self.armor = players
+            .iter()
+            .map(|p| (p.uuid, (p.armor, p.toughness)))
             .collect();
 
         for uuid in std::mem::take(&mut self.pending) {
@@ -353,6 +434,8 @@ mod tests {
             health: 20.0,
             game_mode: 0,
             sneaking: false,
+            armor: 0.0,
+            toughness: 0.0,
         }
     }
 
@@ -362,7 +445,44 @@ mod tests {
             revive_ticks: 10,
             revive_range: 2.0,
             penalty_ticks_per_hp: 1.0,
+            penalty_cap_ticks: 1000,
         }
+    }
+
+    #[test]
+    fn armour_that_would_save_you_does() {
+        let mut r = Revive::new(quick());
+        let mut alex = player(1, "Alex", [0.0; 3]);
+        alex.armor = 20.0; // full diamond
+        alex.toughness = 8.0;
+        r.tick(&[alex, player(2, "Steve", [10.0, 0.0, 0.0])]);
+        // 24 raw is ~5.8 after diamond: not lethal on 20 health.
+        assert!(!r.on_damage(101, "minecraft:player", "minecraft:mob_attack", 24.0));
+        // Falls ignore armour.
+        assert!(r.on_damage(101, "minecraft:player", "minecraft:fall", 15.0));
+    }
+
+    #[test]
+    fn one_hit_costs_at_most_the_cap() {
+        let mut c = quick();
+        c.penalty_cap_ticks = 5;
+        let mut r = Revive::new(c);
+        let players = [player(1, "Alex", [0.0; 3]), player(2, "Steve", [50.0, 0.0, 0.0])];
+        r.tick(&players);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        r.tick(&players);
+        r.on_damage(101, "minecraft:player", "minecraft:explosion", 100.0);
+        assert!(!r.tick(&players).contains(&Action::BledOut { name: "Alex".into() }));
+        assert!(r.is_downed(1));
+    }
+
+    #[test]
+    fn config_round_trips_and_ignores_junk() {
+        let c = Config::from_json(&Config::default().to_json());
+        assert_eq!(c, Config::default());
+        let c = Config::from_json(&json!({"bleed_seconds": 30, "revive_range": "far"}));
+        assert_eq!(c.bleed_ticks, 600);
+        assert_eq!(c.revive_range, Config::default().revive_range);
     }
 
     #[test]
