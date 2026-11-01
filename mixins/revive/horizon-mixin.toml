@@ -108,3 +108,12 @@ helper = "lifecycle.rs"
 bindings = [
   { name = "phase", ty = "crate::game::native_lifecycle::WorldPhase", value = "phase" },
 ]
+
+[[injection]]
+id = "mods"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
+helper = "mods.rs"
+bindings = [
+  { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "mods" },
+]
