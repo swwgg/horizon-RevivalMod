@@ -23,6 +23,8 @@ pub struct Config {
     pub penalty_ticks_per_hp: f32,
     /// The most ticks a single hit on a downed player can cost.
     pub penalty_cap_ticks: u32,
+    /// Ticks a revived player has Revive Sickness (2 minutes default).
+    pub sickness_ticks: u64,
 }
 
 impl Default for Config {
@@ -33,6 +35,7 @@ impl Default for Config {
             revive_range: 2.5,
             penalty_ticks_per_hp: 10.0,
             penalty_cap_ticks: 10 * 20,
+            sickness_ticks: 120 * 20,
         }
     }
 }
@@ -46,6 +49,7 @@ impl Config {
             "revive_range": self.revive_range,
             "penalty_seconds_per_hp": self.penalty_ticks_per_hp as f64 / 20.0,
             "penalty_cap_seconds": self.penalty_cap_ticks as f64 / 20.0,
+            "sickness_seconds": self.sickness_ticks as f64 / 20.0,
         })
     }
 
@@ -69,6 +73,9 @@ impl Config {
         if let Some(v) = num("penalty_cap_seconds") {
             c.penalty_cap_ticks = ticks(v);
         }
+        if let Some(v) = num("sickness_seconds") {
+            c.sickness_ticks = (v * 20.0).round().min(u64::MAX as f64) as u64;
+        }
         c
     }
 }
@@ -84,6 +91,16 @@ pub fn after_armor(damage: f32, armor: f32, toughness: f32) -> f32 {
 
 /// Damage types a teammate couldn't save anyone from: they kill as usual.
 pub const UNSAVABLE: [&str; 2] = ["minecraft:out_of_world", "minecraft:generic_kill"];
+
+/// Continuous environmental damage types that shouldn't drain the timer instantly.
+pub const CONTINUOUS_DAMAGE: [&str; 6] = [
+    "minecraft:in_fire",
+    "minecraft:on_fire",
+    "minecraft:lava",
+    "minecraft:drown",
+    "minecraft:in_wall",
+    "minecraft:freeze",
+];
 
 /// Damage types armour doesn't reduce (vanilla's `#bypasses_armor`).
 pub const ARMOR_IGNORED: [&str; 12] = [
@@ -118,6 +135,8 @@ pub struct PlayerView {
     /// Armour points and toughness worn, as last read (0 when unknown).
     pub armor: f32,
     pub toughness: f32,
+    /// Whether the player holds a Totem of Undying in main hand or offhand.
+    pub has_totem: bool,
 }
 
 impl PlayerView {
@@ -131,7 +150,8 @@ impl PlayerView {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     /// `name` just went down: slow them, tell everyone.
-    Down { name: String },
+    /// `sick` is true if the player collapsed again during Revive Sickness (shorter timer).
+    Down { name: String, sick: bool },
     /// `name` is being got up by `by`, `percent` of the way.
     Progress { name: String, by: String, percent: u32 },
     /// `name` is bleeding, `seconds` left (once a second, when nobody helps).
@@ -173,6 +193,12 @@ pub struct Revive {
     health: HashMap<u128, f32>,
     /// From the last tick: each player's armour points and toughness.
     armor: HashMap<u128, (f32, f32)>,
+    /// Players holding a Totem of Undying.
+    totem: HashSet<u128>,
+    /// Last tick a player took a penalty from continuous DoT damage (fire/lava/drown).
+    last_dot_penalty: HashMap<u128, u64>,
+    /// Expiration tick for Revive Sickness (chain knockout protection).
+    sickness: HashMap<u128, u64>,
     /// Players on and present last tick.
     present: HashSet<u128>,
     tick: u64,
@@ -210,6 +236,15 @@ impl Revive {
         };
         let amount = if amount.is_finite() { amount.max(0.0) } else { f32::MAX };
         if let Some(d) = self.downed.get_mut(&uuid) {
+            // Environmental continuous damage has a 20-tick (1s) cooldown to prevent instant depletion.
+            if CONTINUOUS_DAMAGE.contains(&damage_type) {
+                if let Some(&last) = self.last_dot_penalty.get(&uuid) {
+                    if self.tick.saturating_sub(last) < 20 {
+                        return true;
+                    }
+                }
+                self.last_dot_penalty.insert(uuid, self.tick);
+            }
             // Hits on a downed player shorten their time instead.
             let penalty = (amount * self.config.penalty_ticks_per_hp)
                 .min(self.config.penalty_cap_ticks as f32) as u32;
@@ -220,6 +255,10 @@ impl Revive {
             return true;
         }
         if UNSAVABLE.contains(&damage_type) {
+            return false;
+        }
+        // If holding a Totem of Undying, let vanilla totem mechanics fire instead of downing!
+        if self.totem.contains(&uuid) {
             return false;
         }
         let Some(&health) = self.health.get(&uuid) else {
@@ -273,6 +312,11 @@ impl Revive {
             .iter()
             .map(|p| (p.uuid, (p.armor, p.toughness)))
             .collect();
+        self.totem = players
+            .iter()
+            .filter(|p| p.has_totem)
+            .map(|p| p.uuid)
+            .collect();
 
         for uuid in std::mem::take(&mut self.pending) {
             let Some(p) = by_uuid.get(&uuid) else {
@@ -281,15 +325,22 @@ impl Revive {
             if self.downed.contains_key(&uuid) {
                 continue;
             }
+            let sick = self.sickness.get(&uuid).is_some_and(|&until| self.tick < until);
+            let left = if sick {
+                (self.config.bleed_ticks / 3).max(20 * 10) // 1/3 time, min 10s
+            } else {
+                self.config.bleed_ticks
+            };
             self.downed.insert(
                 uuid,
                 Downed {
-                    left: self.config.bleed_ticks,
+                    left,
                     progress: 0,
                 },
             );
             out.push(Action::Down {
                 name: p.name.clone(),
+                sick,
             });
             changed = true;
         }
@@ -326,6 +377,7 @@ impl Revive {
                     d.progress += 1;
                     if d.progress >= config.revive_ticks {
                         self.downed.remove(&uuid);
+                        self.sickness.insert(uuid, self.tick + config.sickness_ticks);
                         out.push(Action::Revived {
                             name: p.name.clone(),
                             by: r.name.clone(),
@@ -392,7 +444,13 @@ impl Revive {
         }
         let mut kill: Vec<String> = self.pending_kill.iter().map(|u| format!("{u:032x}")).collect();
         kill.sort();
-        json!({ "downed": downed, "pending_kill": kill })
+        let mut sickness = Map::new();
+        for (&uuid, &until) in &self.sickness {
+            if until > self.tick {
+                sickness.insert(format!("{uuid:032x}"), json!(until - self.tick));
+            }
+        }
+        json!({ "downed": downed, "pending_kill": kill, "sickness": sickness })
     }
 
     /// Reads `to_json`'s output; anything it can't read is left out.
@@ -411,6 +469,14 @@ impl Revive {
                 if let Ok(uuid) = u128::from_str_radix(key, 16) {
                     self.pending_kill.insert(uuid);
                 }
+            }
+        }
+        if let Some(sick) = value.get("sickness").and_then(Value::as_object) {
+            for (key, left) in sick {
+                let (Ok(uuid), Some(left)) = (u128::from_str_radix(key, 16), left.as_u64()) else {
+                    continue;
+                };
+                self.sickness.insert(uuid, self.tick + left);
             }
         }
     }
@@ -436,6 +502,7 @@ mod tests {
             sneaking: false,
             armor: 0.0,
             toughness: 0.0,
+            has_totem: false,
         }
     }
 
@@ -446,43 +513,8 @@ mod tests {
             revive_range: 2.0,
             penalty_ticks_per_hp: 1.0,
             penalty_cap_ticks: 1000,
+            sickness_ticks: 100,
         }
-    }
-
-    #[test]
-    fn armour_that_would_save_you_does() {
-        let mut r = Revive::new(quick());
-        let mut alex = player(1, "Alex", [0.0; 3]);
-        alex.armor = 20.0; // full diamond
-        alex.toughness = 8.0;
-        r.tick(&[alex, player(2, "Steve", [10.0, 0.0, 0.0])]);
-        // 24 raw is ~5.8 after diamond: not lethal on 20 health.
-        assert!(!r.on_damage(101, "minecraft:player", "minecraft:mob_attack", 24.0));
-        // Falls ignore armour.
-        assert!(r.on_damage(101, "minecraft:player", "minecraft:fall", 15.0));
-    }
-
-    #[test]
-    fn one_hit_costs_at_most_the_cap() {
-        let mut c = quick();
-        c.penalty_cap_ticks = 5;
-        let mut r = Revive::new(c);
-        let players = [player(1, "Alex", [0.0; 3]), player(2, "Steve", [50.0, 0.0, 0.0])];
-        r.tick(&players);
-        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
-        r.tick(&players);
-        r.on_damage(101, "minecraft:player", "minecraft:explosion", 100.0);
-        assert!(!r.tick(&players).contains(&Action::BledOut { name: "Alex".into() }));
-        assert!(r.is_downed(1));
-    }
-
-    #[test]
-    fn config_round_trips_and_ignores_junk() {
-        let c = Config::from_json(&Config::default().to_json());
-        assert_eq!(c, Config::default());
-        let c = Config::from_json(&json!({"bleed_seconds": 30, "revive_range": "far"}));
-        assert_eq!(c.bleed_ticks, 600);
-        assert_eq!(c.revive_range, Config::default().revive_range);
     }
 
     #[test]
@@ -493,10 +525,61 @@ mod tests {
         assert!(!r.on_damage(101, "minecraft:player", "minecraft:mob_attack", 5.0));
         assert!(r.on_damage(101, "minecraft:player", "minecraft:mob_attack", 15.0));
         let out = r.tick(&players);
-        assert!(out.contains(&Action::Down { name: "Alex".into() }));
+        assert!(out.contains(&Action::Down { name: "Alex".into(), sick: false }));
         assert!(r.is_downed(1));
         // Hits on a downed player are canceled.
         assert!(r.on_damage(101, "minecraft:player", "minecraft:lava", 4.0));
+    }
+
+    #[test]
+    fn holding_totem_does_not_down() {
+        let mut r = Revive::new(quick());
+        let mut alex = player(1, "Alex", [0.0; 3]);
+        alex.has_totem = true;
+        r.tick(&[alex, player(2, "Steve", [10.0, 0.0, 0.0])]);
+        // Lethal hit should NOT be canceled: let vanilla totem trigger!
+        assert!(!r.on_damage(101, "minecraft:player", "minecraft:mob_attack", 25.0));
+        assert!(!r.is_downed(1));
+    }
+
+    #[test]
+    fn revive_sickness_reduces_bleed_time() {
+        let mut r = Revive::new(quick());
+        let mut players = vec![player(1, "Alex", [0.0; 3]), player(2, "Steve", [1.0, 0.0, 0.0])];
+        players[1].sneaking = true;
+        r.tick(&players);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        r.tick(&players);
+        for _ in 0..10 {
+            r.tick(&players);
+        }
+        assert!(!r.is_downed(1)); // Revived!
+
+        // Now Alex takes lethal damage again while sick
+        players[0].health = 20.0;
+        r.tick(&players);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        let out = r.tick(&players);
+        assert!(out.contains(&Action::Down { name: "Alex".into(), sick: true }));
+        // Sickness reduces bleed time (in quick() config: max(40/3, 200) = 200)
+        assert!(r.downed.get(&1).unwrap().left <= 200);
+    }
+
+    #[test]
+    fn continuous_damage_cooldown_works() {
+        let mut r = Revive::new(quick());
+        let players = [player(1, "Alex", [0.0; 3]), player(2, "Steve", [10.0, 0.0, 0.0])];
+        r.tick(&players);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        r.tick(&players);
+        let initial_left = r.downed.get(&1).unwrap().left;
+        // First fire hit takes penalty (4 hp = 4 ticks penalty in quick)
+        assert!(r.on_damage(101, "minecraft:player", "minecraft:on_fire", 4.0));
+        let after_first = r.downed.get(&1).unwrap().left;
+        assert_eq!(after_first, initial_left - 4);
+        // Immediate second fire hit within same tick should NOT penalize again
+        assert!(r.on_damage(101, "minecraft:player", "minecraft:on_fire", 4.0));
+        assert_eq!(r.downed.get(&1).unwrap().left, after_first);
     }
 
     #[test]
@@ -581,7 +664,7 @@ mod tests {
         r.tick(&players);
         r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
         r.tick(&players);
-        r.on_damage(101, "minecraft:player", "minecraft:lava", 100.0);
+        r.on_damage(101, "minecraft:player", "minecraft:explosion", 100.0);
         assert!(r.tick(&players).contains(&Action::BledOut { name: "Alex".into() }));
     }
 
@@ -626,5 +709,41 @@ mod tests {
         players[1].sneaking = true;
         players[1].health = 0.0;
         assert!(r.reviver(&players[0], &players).is_none());
+    }
+
+    #[test]
+    fn armour_that_would_save_you_does() {
+        let mut r = Revive::new(quick());
+        let mut alex = player(1, "Alex", [0.0; 3]);
+        alex.armor = 20.0; // full diamond
+        alex.toughness = 8.0;
+        r.tick(&[alex, player(2, "Steve", [10.0, 0.0, 0.0])]);
+        // 24 raw is ~5.8 after diamond: not lethal on 20 health.
+        assert!(!r.on_damage(101, "minecraft:player", "minecraft:mob_attack", 24.0));
+        // Falls ignore armour.
+        assert!(r.on_damage(101, "minecraft:player", "minecraft:fall", 15.0));
+    }
+
+    #[test]
+    fn one_hit_costs_at_most_the_cap() {
+        let mut c = quick();
+        c.penalty_cap_ticks = 5;
+        let mut r = Revive::new(c);
+        let players = [player(1, "Alex", [0.0; 3]), player(2, "Steve", [50.0, 0.0, 0.0])];
+        r.tick(&players);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        r.tick(&players);
+        r.on_damage(101, "minecraft:player", "minecraft:explosion", 100.0);
+        assert!(!r.tick(&players).contains(&Action::BledOut { name: "Alex".into() }));
+        assert!(r.is_downed(1));
+    }
+
+    #[test]
+    fn config_round_trips_and_ignores_junk() {
+        let c = Config::from_json(&Config::default().to_json());
+        assert_eq!(c, Config::default());
+        let c = Config::from_json(&json!({"bleed_seconds": 30, "revive_range": "far"}));
+        assert_eq!(c.bleed_ticks, 600);
+        assert_eq!(c.revive_range, Config::default().revive_range);
     }
 }

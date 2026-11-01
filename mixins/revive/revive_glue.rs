@@ -15,14 +15,15 @@ use std::{
 
 pub const ID: &str = "revive";
 pub const NAME: &str = "Revive";
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.3.0";
 
 /// The effects a downed player gets: the only ones taken off again, so a
 /// player keeps their potions, beacon and fire resistance.
-const DOWNED_EFFECTS: [(&str, u8); 3] = [
+const DOWNED_EFFECTS: [(&str, u8); 4] = [
     ("slowness", 4),
     ("weakness", 255),
     ("mining_fatigue", 255),
+    ("glowing", 0),
 ];
 
 pub struct ModState {
@@ -119,6 +120,15 @@ fn acting_uuid(game: &Game<'_>) -> Option<u128> {
     }
 }
 
+/// Whether the player with `uuid` is downed.
+pub fn is_downed(uuid: u128) -> bool {
+    STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.revive.is_downed(uuid))
+}
+
 /// Whether the player acting in a hook is downed: their item use, block
 /// clicks and blows are refused, so they can't eat, drink, pearl away,
 /// shoot or build while they lie there.
@@ -126,11 +136,7 @@ pub fn acting_is_downed(game: &mut Game<'_>) -> bool {
     let Some(uuid) = acting_uuid(game) else {
         return false;
     };
-    let downed = STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|s| s.revive.is_downed(uuid));
+    let downed = is_downed(uuid);
     if downed {
         game.native_action_bar(uuid, Text::literal("§cYou are down: wait for a teammate!"));
     }
@@ -162,6 +168,25 @@ pub fn tick(game: &mut Game<'_>) {
     };
 
     let (players, name_to_uuid) = collect_players(game);
+
+    // Maintain crawling / lying down pose for all downed players
+    if let Some(own_uuid) = host_uuid(game) {
+        if is_downed(own_uuid) {
+            if let Some(p) = game.player.as_mut() {
+                let _ = p.set_pose(horizon_client::pose::Pose::Swimming);
+            }
+        }
+    }
+    if let Some(host) = &mut game.lan {
+        for g in &mut host.hub.guests {
+            if is_downed(g.uuid) {
+                if let Some(m) = g.motion.as_mut() {
+                    m.pose = horizon_client::pose::Pose::Swimming;
+                }
+            }
+        }
+    }
+
     // The rules run under the lock; the commands after it, so a hook a
     // command sets off (damage, a player's) never waits on it.
     let actions = {
@@ -181,27 +206,67 @@ pub fn tick(game: &mut Game<'_>) {
         }
         actions
     };
+
     let target = |name: &str| name_to_uuid.get(name).map_or_else(|| name.to_owned(), |&u| selector(u));
 
     for action in actions {
         match action {
-            Action::Down { name } => {
-                game.native_broadcast(Text::literal(format!(
-                    "[Revive] {name} is down! Sneak near them to revive!"
-                )));
-                apply_downed_effects(game, &target(&name));
+            Action::Down { name, sick } => {
+                let who = target(&name);
+                // Dismount from vehicles
+                game.native_run_command(&format!("ride {who} dismount"));
+                if sick {
+                    game.native_broadcast(Text::literal(format!(
+                        "[Revive] §c{name} collapsed again from Revive Sickness! Only 20s left!"
+                    )));
+                } else {
+                    game.native_broadcast(Text::literal(format!(
+                        "[Revive] {name} is down! Sneak near them to revive!"
+                    )));
+                }
+
+                // Set visual health to 1.0 (half heart)
+                if let Some(&uuid) = name_to_uuid.get(&name) {
+                    if let Some(own_uuid) = host_uuid(game) {
+                        if uuid == own_uuid {
+                            if let Some(p) = game.player.as_mut() {
+                                let _ = p.set_health(1.0, false);
+                            }
+                        }
+                    }
+                    if let Some(host) = &mut game.lan {
+                        if let Some(g) = host.hub.guests.iter_mut().find(|g| g.uuid == uuid) {
+                            g.health = 1.0;
+                        }
+                    }
+                }
+
+                // Bell resonance sound and damage indicator particles
+                game.native_run_command(&format!("execute at {who} run playsound minecraft:block.bell.resonate player @a ~ ~ ~ 1.5 0.8"));
+                game.native_run_command(&format!("execute at {who} run particle minecraft:damage_indicator ~ ~1 ~ 0.5 0.5 0.5 0.1 20"));
+                apply_downed_effects(game, &who);
             }
             Action::Bleeding { name, seconds } => {
-                apply_downed_effects(game, &target(&name));
+                let who = target(&name);
+                apply_downed_effects(game, &who);
                 if let Some(&uuid) = name_to_uuid.get(&name) {
                     game.native_action_bar(
                         uuid,
                         Text::literal(format!("§cBleeding out! Time left: {seconds}s")),
                     );
                 }
+                // Heartbeat sound
+                if seconds <= 15 {
+                    game.native_run_command(&format!("execute at {who} run playsound minecraft:entity.warden.heartbeat player @a ~ ~ ~ 1.2 1.3"));
+                } else if seconds % 3 == 0 {
+                    game.native_run_command(&format!("execute at {who} run playsound minecraft:entity.warden.heartbeat player @a ~ ~ ~ 0.8 0.8"));
+                }
+                // Blood dust particles
+                game.native_run_command(&format!("execute at {who} run particle minecraft:dust 1 0 0 1 ~ ~0.5 ~ 0.3 0.2 0.3 0 4"));
             }
             Action::Progress { name, by, percent } => {
-                apply_downed_effects(game, &target(&name));
+                let who = target(&name);
+                apply_downed_effects(game, &who);
                 if let Some(&uuid) = name_to_uuid.get(&name) {
                     game.native_action_bar(
                         uuid,
@@ -214,6 +279,13 @@ pub fn tick(game: &mut Game<'_>) {
                         Text::literal(format!("§aReviving {name}... {percent}%")),
                     );
                 }
+                // Rising chime sound with percentage
+                if percent % 10 == 0 {
+                    let pitch = 0.5 + (percent as f32 / 100.0) * 0.5;
+                    game.native_run_command(&format!("execute at {who} run playsound minecraft:block.note_block.chime player @a ~ ~ ~ 0.6 {pitch:.2}"));
+                }
+                // Happy villager / heart sparkles
+                game.native_run_command(&format!("execute at {who} run particle minecraft:happy_villager ~ ~0.8 ~ 0.4 0.4 0.4 0 6"));
             }
             Action::Revived { name, by } => {
                 let who = target(&name);
@@ -221,10 +293,15 @@ pub fn tick(game: &mut Game<'_>) {
                 game.native_run_command(&format!("effect give {who} regeneration 8 1 true"));
                 game.native_run_command(&format!("effect give {who} resistance 8 1 true"));
                 game.native_broadcast(Text::literal(format!("[Revive] {by} revived {name}!")));
+                // Totem and levelup celebration sounds & particles
+                game.native_run_command(&format!("execute at {who} run playsound minecraft:item.totem.use player @a ~ ~ ~ 1.0 1.0"));
+                game.native_run_command(&format!("execute at {who} run playsound minecraft:entity.player.levelup player @a ~ ~ ~ 1.0 1.0"));
+                game.native_run_command(&format!("execute at {who} run particle minecraft:totem_of_undying ~ ~1 ~ 0.5 0.8 0.5 0.2 50"));
             }
             Action::BledOut { name } => {
                 let who = target(&name);
                 clear_downed_effects(game, &who);
+                game.native_run_command(&format!("execute at {who} run playsound minecraft:entity.wither.spawn player @a ~ ~ ~ 0.8 0.5"));
                 game.native_run_command(&format!("kill {who}"));
                 game.native_broadcast(Text::literal(format!("[Revive] {name} bled out.")));
             }
@@ -268,6 +345,8 @@ fn collect_players(game: &Game<'_>) -> (Vec<PlayerView>, HashMap<String, u128>) 
                 continue;
             }
             let (armor, toughness) = worn(g.uuid);
+            let has_totem = g.offhand.as_ref().is_some_and(|s| &*s.item == "minecraft:totem_of_undying")
+                || g.inventory.get(g.selected).and_then(|s| s.as_ref()).is_some_and(|s| &*s.item == "minecraft:totem_of_undying");
             players.push(PlayerView {
                 uuid: g.uuid,
                 entity: g.entity_id,
@@ -279,6 +358,7 @@ fn collect_players(game: &Game<'_>) -> (Vec<PlayerView>, HashMap<String, u128>) 
                 sneaking: g.sneaking,
                 armor,
                 toughness,
+                has_totem,
             });
             name_to_uuid.insert(g.name.clone(), g.uuid);
         }
@@ -296,6 +376,8 @@ fn collect_players(game: &Game<'_>) -> (Vec<PlayerView>, HashMap<String, u128>) 
         if !name_to_uuid.contains_key(&name) {
             let sneaking = p.shift_key_down || p.pose == horizon_client::pose::Pose::Crouching;
             let (armor, toughness) = worn(own_uuid);
+            let has_totem = game.held().is_some_and(|s| &*s.item == "minecraft:totem_of_undying")
+                || game.offhand.as_ref().is_some_and(|s| &*s.item == "minecraft:totem_of_undying");
             players.push(PlayerView {
                 uuid: own_uuid,
                 entity,
@@ -307,6 +389,7 @@ fn collect_players(game: &Game<'_>) -> (Vec<PlayerView>, HashMap<String, u128>) 
                 sneaking,
                 armor,
                 toughness,
+                has_totem,
             });
             name_to_uuid.insert(name, own_uuid);
         }

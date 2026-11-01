@@ -1,6 +1,6 @@
 [mod]
 id = "revive"
-version = "0.2.0"
+version = "0.3.0"
 priority = 100
 
 [compatibility]
@@ -116,4 +116,14 @@ target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
 helper = "mods.rs"
 bindings = [
   { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "mods" },
+]
+
+[[injection]]
+id = "drop_held"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::Game<'_>::drop_held"
+helper = "drop.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
 ]
