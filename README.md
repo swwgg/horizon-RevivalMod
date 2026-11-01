@@ -1,30 +1,30 @@
-# Horizon RevivalMod
+# Horizon Revival Mod
 
-Нативный мод для [Horizon](https://github.com/horizon-rust/horizon) (Minecraft на Rust), добавляющий механику нокаута и воскрешения для совместной игры в хардкоре.
+A native Rust mod for [Horizon](https://github.com/horizon-rust/horizon) that adds a co-op knockdown and revive mechanic for hardcore mode.
 
-Если вы играете с напарником и получаете смертельный урон, персонаж не умирает мгновенно, а падает на землю. У тиммейта есть время, чтобы подбежать и поднять вас на ноги.
+When taking fatal damage, players are knocked down instead of dying instantly, giving teammates a chance to save them.
 
-## Механики и возможности
+## Features
 
-* **Нокаут вместо смерти:** при смертельном ударе (падение, крипер, мобы и т.д.) персонаж валится на землю (поза ползания/лежания), здоровье опускается до полусердечка, включается эффект белого свечения (`glowing`), видимый сквозь стены.
-* **Блокировка действий и защита от выброса вещей:** лежачий игрок не может ломать/ставить блоки, бить, есть, пить зелья, кидать жемчуг Края или сбрасывать вещи на клавишу `Q`.
-* **Автоматическое спешивание:** при падении в нокаут игрок сразу спешивается с лодки, вагонетки или лошади.
-* **Защита от порталов:** лежачий игрок не может перемещаться между измерениями через порталы Незера или Энда.
-* **Таймер (60 секунд):** над хотбаром тикает отсчет со звуком пульсирующего сердцебиения (ускоряется на последних 15 секундах). Вокруг лежачего падают частицы крови.
-* **Защита от непрерывного урона:** периодический урон от огня, лавы или удушья имеет секундный кулдаун штрафа, чтобы таймер не сгорал за секунды.
-* **Тотем бессмертия:** если у игрока в руках Тотем бессмертия, он спасает персонажа штатно (без падения в нокаут).
-* **Воскрешение:** тиммейт должен подойти вплотную (до 2.5 блоков), **стоять на земле (`on_ground`) и зажать Shift (присесть)**. Прыжки или падение в воздухе прерывают процесс. Таймер замирает, играет нарастающий перелив колокольчиков и идут зеленые частицы (длится 5 секунд).
-* **Хардкорный подъем (Shock & Trauma):** игрок встает всего с **2 сердечками (4 HP)** без авторегенерации — восстанавливать здоровье придется едой или зельями. Персонаж переживает шок от подъема: потемнение в глазах (Темнота на 4 сек), хромота (Замедление I на 15 сек), слабость в руках (Слабость I на 20 сек) и истощение (Голод II на 10 сек). Дается лишь кратковременное Сопротивление I на 2 секунды, чтобы не погибнуть от случайного удара в первую миллисекунду. Снимаются только эффекты нокаута (баффы маяка и зелий сохраняются).
-* **Защита от цепочки нокаутов (Revive Sickness):** если после подъема игрок падает снова в течение 2 минут, таймер до смерти сокращается в 3 раза (20 секунд вместо 60).
-* **Командное поражение (Squad Wipe):** если все игроки на сервере пали или погибли (на ногах не осталось никого), оставшиеся лежачие погибают мгновенно без ожидания конца таймера.
-* **Исключения:** бездна (`minecraft:out_of_world`) и команда `/kill` убивают сразу даже в нокауте. Если игрок на сервере один, смерть наступает сразу.
-* **Конфигурация:** настройки создаются автоматически в `<мир>/horizon-revive/config.json`.
+* **Knocked Down, Not Dead:** Fall to the ground (crawling pose) with a glowing outline visible through walls.
+* **Action Lock:** Downed players cannot move, attack, break blocks, use items, drop items (`Q`), or use portals.
+* **60s Bleed-out Timer:** Actionbar countdown with heartbeat sounds and blood particles. DoT (fire, poison) chips away remaining time.
+* **Totem Support:** Totem of Undying triggers normally first and prevents knockdown.
+* **Reviving:** Approach a downed teammate (≤ 2.5m), stand on the ground, and **hold Shift (sneak)** for 5 seconds.
+* **Hardcore Recovery:** Get back up with only **2 hearts (4 HP)** and trauma debuffs (Darkness, Slowness, Weakness, Hunger). No free regeneration!
+* **Revive Sickness:** Getting downed again within 2 minutes reduces bleed-out time to 20 seconds.
+* **Squad Wipe:** If all players are down or dead, the run ends immediately.
+* **Instant Death:** Void damage and `/kill` bypass knockdown. Single-player deaths are instant.
 
-## Установка
+## Installation
 
-1. Откройте **Horizon Launcher** -> **Моды** -> вкладка **«Моды Horizon»** (нативные моды).
-2. В поле **«Добавить нативный мод с GitHub»** вставьте ссылку:
+1. Open **Horizon Launcher** → **Mods** → **Horizon Mods** tab.
+2. In **"Add native mod from GitHub"**, paste:
    ```text
    https://github.com/swwgg/horizon-RevivalMod
    ```
-3. Нажмите **«Добавить с GitHub»** и затем **«Собрать» (Build)**.
+3. Click **Add from GitHub**, then click **Build**.
+
+## Configuration
+
+Customizable via `<world>/horizon-revive/config.json` (auto-generated on world start).
