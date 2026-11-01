@@ -15,7 +15,7 @@ use std::{
 
 pub const ID: &str = "revive";
 pub const NAME: &str = "Revive";
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.4.0";
 
 /// The effects a downed player gets: the only ones taken off again, so a
 /// player keeps their potions, beacon and fire resistance.
@@ -305,6 +305,10 @@ pub fn tick(game: &mut Game<'_>) {
                 game.native_run_command(&format!("kill {who}"));
                 game.native_broadcast(Text::literal(format!("[Revive] {name} bled out.")));
             }
+            Action::SquadWipe => {
+                game.native_broadcast(Text::literal("[Revive] §cAll teammates are down! Squad eliminated."));
+                game.native_run_command("playsound minecraft:entity.wither.spawn player @a ~ ~ ~ 1.0 0.5");
+            }
             Action::Cleared { name } => {
                 clear_downed_effects(game, &target(&name));
             }
@@ -359,6 +363,7 @@ fn collect_players(game: &Game<'_>) -> (Vec<PlayerView>, HashMap<String, u128>) 
                 armor,
                 toughness,
                 has_totem,
+                on_ground: g.on_ground,
             });
             name_to_uuid.insert(g.name.clone(), g.uuid);
         }
@@ -390,6 +395,7 @@ fn collect_players(game: &Game<'_>) -> (Vec<PlayerView>, HashMap<String, u128>) 
                 armor,
                 toughness,
                 has_totem,
+                on_ground: p.ground.on_ground,
             });
             name_to_uuid.insert(name, own_uuid);
         }

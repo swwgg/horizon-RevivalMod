@@ -1,6 +1,6 @@
 [mod]
 id = "revive"
-version = "0.3.0"
+version = "0.4.0"
 priority = 100
 
 [compatibility]
@@ -124,6 +124,16 @@ kind = "HEAD"
 cancellable = true
 target = "horizon_client::game::Game<'_>::drop_held"
 helper = "drop.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+]
+
+[[injection]]
+id = "enter_dimension"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::Game<'_>::enter_dimension"
+helper = "portal.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
 ]

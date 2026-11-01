@@ -137,11 +137,13 @@ pub struct PlayerView {
     pub toughness: f32,
     /// Whether the player holds a Totem of Undying in main hand or offhand.
     pub has_totem: bool,
+    /// Standing on ground (not jumping or mid-air).
+    pub on_ground: bool,
 }
 
 impl PlayerView {
     /// Alive and in a mode where they can be hurt (survival, adventure).
-    fn mortal(&self) -> bool {
+    pub fn mortal(&self) -> bool {
         self.health > 0.0 && matches!(self.game_mode, 0 | 2)
     }
 }
@@ -160,6 +162,8 @@ pub enum Action {
     Revived { name: String, by: String },
     /// `name` bled out: take the downed state off and kill them.
     BledOut { name: String },
+    /// All players are dead or downed: instant defeat.
+    SquadWipe,
     /// `name` stopped being downed some other way (creative, spectator,
     /// dead): only take the downed state off.
     Cleared { name: String },
@@ -234,6 +238,12 @@ impl Revive {
         let Some(&uuid) = self.uuid_of.get(&entity) else {
             return false;
         };
+        // Unsavable damage (void, /kill) ALWAYS kills, even if already downed!
+        if UNSAVABLE.contains(&damage_type) {
+            self.downed.remove(&uuid);
+            self.pending.retain(|&u| u != uuid);
+            return false;
+        }
         let amount = if amount.is_finite() { amount.max(0.0) } else { f32::MAX };
         if let Some(d) = self.downed.get_mut(&uuid) {
             // Environmental continuous damage has a 20-tick (1s) cooldown to prevent instant depletion.
@@ -253,9 +263,6 @@ impl Revive {
         }
         if self.pending.contains(&uuid) {
             return true;
-        }
-        if UNSAVABLE.contains(&damage_type) {
-            return false;
         }
         // If holding a Totem of Undying, let vanilla totem mechanics fire instead of downing!
         if self.totem.contains(&uuid) {
@@ -317,6 +324,23 @@ impl Revive {
             .filter(|p| p.has_totem)
             .map(|p| p.uuid)
             .collect();
+
+        // Squad Wipe check: if no player is left alive and standing, wipe remaining downed players!
+        let any_capable_helper = players
+            .iter()
+            .any(|p| p.mortal() && !self.is_downed(p.uuid));
+
+        if !any_capable_helper && (!self.downed.is_empty() || !self.pending.is_empty()) {
+            for uuid in self.downed.keys().copied().chain(self.pending.drain(..)) {
+                if let Some(p) = by_uuid.get(&uuid) {
+                    out.push(Action::BledOut { name: p.name.clone() });
+                }
+            }
+            self.downed.clear();
+            out.push(Action::SquadWipe);
+            out.push(Action::Save);
+            return out;
+        }
 
         for uuid in std::mem::take(&mut self.pending) {
             let Some(p) = by_uuid.get(&uuid) else {
@@ -416,8 +440,8 @@ impl Revive {
         out
     }
 
-    /// The teammate getting `downed` up: mortal, not downed, in the same
-    /// dimension, close enough and sneaking. The nearest when several are.
+    /// The teammate getting `downed` up: mortal, not downed, on ground,
+    /// in the same dimension, close enough and sneaking. The nearest when several are.
     fn reviver<'a>(&self, downed: &PlayerView, players: &'a [PlayerView]) -> Option<&'a PlayerView> {
         let range = self.config.revive_range;
         players
@@ -426,6 +450,7 @@ impl Revive {
                 r.uuid != downed.uuid
                     && r.mortal()
                     && r.sneaking
+                    && r.on_ground
                     && !self.is_downed(r.uuid)
                     && r.dimension == downed.dimension
                     && distance_sq(r.pos, downed.pos) <= range * range
@@ -503,6 +528,7 @@ mod tests {
             armor: 0.0,
             toughness: 0.0,
             has_totem: false,
+            on_ground: true,
         }
     }
 
@@ -529,6 +555,51 @@ mod tests {
         assert!(r.is_downed(1));
         // Hits on a downed player are canceled.
         assert!(r.on_damage(101, "minecraft:player", "minecraft:lava", 4.0));
+    }
+
+    #[test]
+    fn void_damage_while_downed_kills_immediately() {
+        let mut r = Revive::new(quick());
+        let players = [player(1, "Alex", [0.0; 3]), player(2, "Steve", [10.0, 0.0, 0.0])];
+        r.tick(&players);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        r.tick(&players);
+        assert!(r.is_downed(1));
+        // Falling into the void while downed must NOT be canceled: it kills immediately!
+        assert!(!r.on_damage(101, "minecraft:player", "minecraft:out_of_world", 10.0));
+        assert!(!r.is_downed(1));
+    }
+
+    #[test]
+    fn squad_wipe_when_all_are_down_or_dead() {
+        let mut r = Revive::new(quick());
+        let mut players = vec![player(1, "Alex", [0.0; 3]), player(2, "Steve", [10.0, 0.0, 0.0])];
+        r.tick(&players);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        r.tick(&players);
+        assert!(r.is_downed(1));
+
+        // Steve dies!
+        players[1].health = 0.0;
+        let out = r.tick(&players);
+        assert!(out.contains(&Action::SquadWipe));
+        assert!(out.contains(&Action::BledOut { name: "Alex".into() }));
+        assert!(!r.is_downed(1));
+    }
+
+    #[test]
+    fn reviver_must_be_on_ground() {
+        let mut r = Revive::new(quick());
+        let mut players = vec![player(1, "Alex", [0.0; 3]), player(2, "Steve", [1.0, 0.0, 0.0])];
+        players[1].sneaking = true;
+        players[1].on_ground = false; // jumping or falling
+        r.tick(&players);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        r.tick(&players);
+        // Not on ground -> cannot revive!
+        assert!(r.reviver(&players[0], &players).is_none());
+        players[1].on_ground = true;
+        assert!(r.reviver(&players[0], &players).is_some());
     }
 
     #[test]
