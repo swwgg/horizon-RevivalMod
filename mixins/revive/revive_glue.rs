@@ -290,8 +290,35 @@ pub fn tick(game: &mut Game<'_>) {
             Action::Revived { name, by } => {
                 let who = target(&name);
                 clear_downed_effects(game, &who);
-                game.native_run_command(&format!("effect give {who} regeneration 8 1 true"));
-                game.native_run_command(&format!("effect give {who} resistance 8 1 true"));
+
+                // Set health to 4.0 HP (2 hearts) - hardcore recovery
+                if let Some(&uuid) = name_to_uuid.get(&name) {
+                    if let Some(own_uuid) = host_uuid(game) {
+                        if uuid == own_uuid {
+                            if let Some(p) = game.player.as_mut() {
+                                let _ = p.set_health(4.0, false);
+                            }
+                        }
+                    }
+                    if let Some(host) = &mut game.lan {
+                        if let Some(g) = host.hub.guests.iter_mut().find(|g| g.uuid == uuid) {
+                            g.health = 4.0;
+                        }
+                    }
+                }
+
+                // Hardcore "Shock & Trauma" recovery debuffs:
+                // 1. Brief resistance (2s) just to prevent instant frame-1 one-tap
+                game.native_run_command(&format!("effect give {who} resistance 2 0 true"));
+                // 2. Concussion: Darkness for 4s (vision blacking out / waking up)
+                game.native_run_command(&format!("effect give {who} darkness 4 0 true"));
+                // 3. Limping: Slowness I for 15s (injured legs, cannot sprint away)
+                game.native_run_command(&format!("effect give {who} slowness 15 0 true"));
+                // 4. Trauma: Weakness I for 20s (shaking hands, reduced damage)
+                game.native_run_command(&format!("effect give {who} weakness 20 0 true"));
+                // 5. Exhaustion: Hunger II for 10s (depletes food, requires eating)
+                game.native_run_command(&format!("effect give {who} hunger 10 1 true"));
+
                 game.native_broadcast(Text::literal(format!("[Revive] {by} revived {name}!")));
                 // Totem and levelup celebration sounds & particles
                 game.native_run_command(&format!("execute at {who} run playsound minecraft:item.totem.use player @a ~ ~ ~ 1.0 1.0"));
