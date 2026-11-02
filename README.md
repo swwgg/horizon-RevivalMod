@@ -6,13 +6,13 @@ When taking fatal damage, players are knocked down instead of dying instantly, g
 
 ## Features
 
-* **Knocked Down, Not Dead:** Fall to the ground (crawling pose) with a glowing outline visible through walls.
+* **Knocked Down, Not Dead:** Fall to the ground (crawling pose). A shockwave knocks back nearby mobs and defuses creeper fuses. You gain Invisibility so mobs drop aggro and retarget standing players, while a glowing outline keeps you visible to teammates.
 * **Action Lock:** Downed players cannot move, attack, break blocks, use items, drop items (`Q`), or use portals.
-* **60s Bleed-out Timer:** Actionbar countdown with heartbeat sounds and blood particles. DoT (fire, poison) chips away remaining time.
+* **40s Bleed-out Timer:** Actionbar countdown with heartbeat sounds and blood particles. Damage penalties have a 1s cooldown (i-frames) so mobs cannot shred your timer instantly.
 * **Totem Support:** Totem of Undying triggers normally first and prevents knockdown.
 * **Reviving:** Approach a downed teammate (≤ 2.5m), stand on the ground, and **hold Shift (sneak)** for 5 seconds.
 * **Hardcore Recovery:** Get back up with only **2 hearts (4 HP)** and trauma debuffs (Darkness, Slowness, Weakness, Hunger). No free regeneration!
-* **Revive Sickness:** Getting downed again within 2 minutes reduces bleed-out time to 20 seconds.
+* **Revive Sickness:** Getting downed again within 2 minutes halves bleed-out time to 20 seconds.
 * **Squad Wipe:** If all players are down or dead, the run ends immediately.
 * **Instant Death:** Void damage and `/kill` bypass knockdown. Single-player deaths are instant.
 

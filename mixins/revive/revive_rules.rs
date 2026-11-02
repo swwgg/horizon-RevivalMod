@@ -30,11 +30,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            bleed_ticks: 60 * 20,
+            bleed_ticks: 40 * 20,
             revive_ticks: 5 * 20,
             revive_range: 2.5,
-            penalty_ticks_per_hp: 10.0,
-            penalty_cap_ticks: 10 * 20,
+            penalty_ticks_per_hp: 5.0,
+            penalty_cap_ticks: 4 * 20,
             sickness_ticks: 120 * 20,
         }
     }
@@ -93,6 +93,7 @@ pub fn after_armor(damage: f32, armor: f32, toughness: f32) -> f32 {
 pub const UNSAVABLE: [&str; 2] = ["minecraft:out_of_world", "minecraft:generic_kill"];
 
 /// Continuous environmental damage types that shouldn't drain the timer instantly.
+#[allow(dead_code)]
 pub const CONTINUOUS_DAMAGE: [&str; 6] = [
     "minecraft:in_fire",
     "minecraft:on_fire",
@@ -246,15 +247,14 @@ impl Revive {
         }
         let amount = if amount.is_finite() { amount.max(0.0) } else { f32::MAX };
         if let Some(d) = self.downed.get_mut(&uuid) {
-            // Environmental continuous damage has a 20-tick (1s) cooldown to prevent instant depletion.
-            if CONTINUOUS_DAMAGE.contains(&damage_type) {
-                if let Some(&last) = self.last_dot_penalty.get(&uuid) {
-                    if self.tick.saturating_sub(last) < 20 {
-                        return true;
-                    }
+            // 20-tick (1s) cooldown between penalties (i-frames) so mobs/fire cannot shred the timer instantly.
+            if let Some(&last) = self.last_dot_penalty.get(&uuid) {
+                if self.tick.saturating_sub(last) < 20 {
+                    return true;
                 }
-                self.last_dot_penalty.insert(uuid, self.tick);
             }
+            self.last_dot_penalty.insert(uuid, self.tick);
+
             // Hits on a downed player shorten their time instead.
             let penalty = (amount * self.config.penalty_ticks_per_hp)
                 .min(self.config.penalty_cap_ticks as f32) as u32;
@@ -351,7 +351,7 @@ impl Revive {
             }
             let sick = self.sickness.get(&uuid).is_some_and(|&until| self.tick < until);
             let left = if sick {
-                (self.config.bleed_ticks / 3).max(20 * 10) // 1/3 time, min 10s
+                (self.config.bleed_ticks / 2).max(20) // 20s (half of bleed timer)
             } else {
                 self.config.bleed_ticks
             };

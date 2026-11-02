@@ -15,15 +15,16 @@ use std::{
 
 pub const ID: &str = "revive";
 pub const NAME: &str = "Revive";
-pub const VERSION: &str = "0.4.0";
+pub const VERSION: &str = "0.5.0";
 
 /// The effects a downed player gets: the only ones taken off again, so a
 /// player keeps their potions, beacon and fire resistance.
-const DOWNED_EFFECTS: [(&str, u8); 4] = [
+const DOWNED_EFFECTS: [(&str, u8); 5] = [
     ("slowness", 4),
     ("weakness", 255),
     ("mining_fatigue", 255),
     ("glowing", 0),
+    ("invisibility", 0),
 ];
 
 pub struct ModState {
@@ -241,8 +242,35 @@ pub fn tick(game: &mut Game<'_>) {
                     }
                 }
 
-                // Bell resonance sound and damage indicator particles
+                // Shockwave on knockdown: repel nearby mobs and defuse creeper fuses
+                if let Some(&uuid) = name_to_uuid.get(&name) {
+                    if let Some(p) = players.iter().find(|p| p.uuid == uuid) {
+                        let [px, py, pz] = p.pos;
+                        for mob in &mut game.mobs {
+                            if mob.removed || mob.health <= 0.0 {
+                                continue;
+                            }
+                            let dx = mob.position.x - px;
+                            let dy = mob.position.y - py;
+                            let dz = mob.position.z - pz;
+                            let dist_sq = dx * dx + dy * dy + dz * dz;
+                            if dist_sq < 4.5 * 4.5 {
+                                let dist = dist_sq.sqrt().max(0.1);
+                                mob.velocity.x += (dx / dist) * 0.8;
+                                mob.velocity.y = 0.35;
+                                mob.velocity.z += (dz / dist) * 0.8;
+                                mob.needs_sync = true;
+                                mob.swell = 0;
+                            }
+                        }
+                    }
+                }
+
+                // Blast & bell resonance sound and shockwave particles
+                game.native_run_command(&format!("execute at {who} run playsound minecraft:entity.generic.explode player @a ~ ~ ~ 0.7 1.5"));
                 game.native_run_command(&format!("execute at {who} run playsound minecraft:block.bell.resonate player @a ~ ~ ~ 1.5 0.8"));
+                game.native_run_command(&format!("execute at {who} run particle minecraft:sweep_attack ~ ~0.5 ~ 0.5 0.2 0.5 0 6"));
+                game.native_run_command(&format!("execute at {who} run particle minecraft:poof ~ ~0.5 ~ 0.6 0.2 0.6 0.05 12"));
                 game.native_run_command(&format!("execute at {who} run particle minecraft:damage_indicator ~ ~1 ~ 0.5 0.5 0.5 0.1 20"));
                 apply_downed_effects(game, &who);
             }
