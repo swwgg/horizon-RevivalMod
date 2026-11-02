@@ -1,6 +1,6 @@
 [mod]
 id = "revive"
-version = "0.5.0"
+version = "1.0.0"
 priority = 100
 
 [compatibility]

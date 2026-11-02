@@ -15,12 +15,12 @@ use std::{
 
 pub const ID: &str = "revive";
 pub const NAME: &str = "Revive";
-pub const VERSION: &str = "0.5.0";
+pub const VERSION: &str = "1.0.0";
 
 /// The effects a downed player gets: the only ones taken off again, so a
 /// player keeps their potions, beacon and fire resistance.
 const DOWNED_EFFECTS: [(&str, u8); 5] = [
-    ("slowness", 4),
+    ("slowness", 5),
     ("weakness", 255),
     ("mining_fatigue", 255),
     ("glowing", 0),
@@ -170,11 +170,15 @@ pub fn tick(game: &mut Game<'_>) {
 
     let (players, name_to_uuid) = collect_players(game);
 
-    // Maintain crawling / lying down pose for all downed players
+    // Maintain crawling / lying down pose and agonizingly slow wounded crawl for all downed players
     if let Some(own_uuid) = host_uuid(game) {
         if is_downed(own_uuid) {
             if let Some(p) = game.player.as_mut() {
                 let _ = p.set_pose(horizon_client::pose::Pose::Swimming);
+                p.jumping = false;
+                p.mobility_restricted = true;
+                p.velocity.x *= 0.6;
+                p.velocity.z *= 0.6;
             }
         }
     }
@@ -183,6 +187,10 @@ pub fn tick(game: &mut Game<'_>) {
             if is_downed(g.uuid) {
                 if let Some(m) = g.motion.as_mut() {
                     m.pose = horizon_client::pose::Pose::Swimming;
+                    m.jumping = false;
+                    m.mobility_restricted = true;
+                    m.velocity.x *= 0.6;
+                    m.velocity.z *= 0.6;
                 }
             }
         }

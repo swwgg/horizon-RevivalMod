@@ -6,7 +6,7 @@ When taking fatal damage, players are knocked down instead of dying instantly, g
 
 ## Features
 
-* **Knocked Down, Not Dead:** Fall to the ground (crawling pose). A shockwave knocks back nearby mobs and defuses creeper fuses. You gain Invisibility so mobs drop aggro and retarget standing players, while a glowing outline keeps you visible to teammates.
+* **Knocked Down, Not Dead:** Fall into a slow wounded crawl (lying down pose) with restricted mobility and no jumping. A shockwave knocks back nearby mobs and defuses creeper fuses. You gain Invisibility so mobs drop aggro and retarget standing players, while a glowing outline keeps you visible to teammates.
 * **Action Lock:** Downed players cannot move, attack, break blocks, use items, drop items (`Q`), or use portals.
 * **40s Bleed-out Timer:** Actionbar countdown with heartbeat sounds and blood particles. Damage penalties have a 1s cooldown (i-frames) so mobs cannot shred your timer instantly.
 * **Totem Support:** Totem of Undying triggers normally first and prevents knockdown.
