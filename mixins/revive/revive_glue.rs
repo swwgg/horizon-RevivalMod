@@ -399,14 +399,6 @@ pub fn tick(game: &mut Game<'_>) {
                 game.native_run_command(&format!("execute at {who} run particle minecraft:totem_of_undying ~ ~1 ~ 0.5 0.8 0.5 0.2 50"));
                 game.native_run_command(&format!("execute at {who} run particle minecraft:sweep_attack ~ ~0.5 ~ 0.5 0.2 0.5 0 6"));
             }
-
-                game.native_broadcast(Text::literal(format!("[Revive] {by} revived {name}!")));
-                // Totem and levelup celebration sounds & particles
-                game.native_run_command(&format!("execute at {who} run playsound minecraft:item.totem.use player @a ~ ~ ~ 1.0 1.0"));
-                game.native_run_command(&format!("execute at {who} run playsound minecraft:entity.player.levelup player @a ~ ~ ~ 1.0 1.0"));
-                game.native_run_command(&format!("execute at {who} run particle minecraft:totem_of_undying ~ ~1 ~ 0.5 0.8 0.5 0.2 50"));
-                game.native_run_command(&format!("execute at {who} run particle minecraft:sweep_attack ~ ~0.5 ~ 0.5 0.2 0.5 0 6"));
-            }
             Action::BledOut { name } => {
                 let who = target(&name);
                 clear_downed_effects(game, &who);
