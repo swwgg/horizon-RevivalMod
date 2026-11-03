@@ -15,7 +15,7 @@ use std::{
 
 pub const ID: &str = "revive";
 pub const NAME: &str = "Revive";
-pub const VERSION: &str = "1.0.1";
+pub const VERSION: &str = "1.0.2";
 
 /// The effects a downed player gets: the only ones taken off again, so a
 /// player keeps their potions, beacon and fire resistance.
@@ -397,15 +397,15 @@ fn clear_downed_effects(game: &mut Game<'_>, who: &str) {
 }
 
 /// Clears target, navigation and aggro from any hostile mobs near downed players,
-/// so they ignore downed players and focus on standing players or wander.
+/// while ensuring standing teammates in combat range can still fight mobs normally.
 fn deaggro_mobs_from_downed(game: &mut Game<'_>, players: &[PlayerView]) {
-    let downed_positions: Vec<[f64; 3]> = players
+    let downed: Vec<&PlayerView> = players.iter().filter(|p| is_downed(p.uuid)).collect();
+    let standing: Vec<&PlayerView> = players
         .iter()
-        .filter(|p| is_downed(p.uuid))
-        .map(|p| p.pos)
+        .filter(|p| !is_downed(p.uuid) && p.mortal())
         .collect();
 
-    if downed_positions.is_empty() {
+    if downed.is_empty() {
         return;
     }
 
@@ -414,11 +414,28 @@ fn deaggro_mobs_from_downed(game: &mut Game<'_>, players: &[PlayerView]) {
             continue;
         }
 
-        let near_downed = downed_positions.iter().any(|&[px, py, pz]| {
-            let dx = mob.position.x - px;
-            let dy = mob.position.y - py;
-            let dz = mob.position.z - pz;
-            dx * dx + dy * dy + dz * dz < 20.0 * 20.0
+        let mob_pos = [mob.position.x, mob.position.y, mob.position.z];
+
+        // If an active standing teammate is within combat range (10 blocks),
+        // let the mob fight the teammate normally without clearing AI or targets!
+        let near_standing_combat = standing.iter().any(|p| {
+            let dx = mob_pos[0] - p.pos[0];
+            let dy = mob_pos[1] - p.pos[1];
+            let dz = mob_pos[2] - p.pos[2];
+            dx * dx + dy * dy + dz * dz < 10.0 * 10.0
+        });
+
+        if near_standing_combat {
+            continue;
+        }
+
+        // Otherwise, if the mob is near a downed player (within 16 blocks) and no standing
+        // player is around, clear target so it stops swarming the helpless downed body.
+        let near_downed = downed.iter().any(|p| {
+            let dx = mob_pos[0] - p.pos[0];
+            let dy = mob_pos[1] - p.pos[1];
+            let dz = mob_pos[2] - p.pos[2];
+            dx * dx + dy * dy + dz * dz < 16.0 * 16.0
         });
 
         if near_downed {
