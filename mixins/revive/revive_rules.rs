@@ -415,7 +415,7 @@ impl Revive {
                             name: p.name.clone(),
                         });
                         changed = true;
-                    } else if d.left % 20 == 0 || self.tick % 20 == 0 {
+                    } else if d.left % 20 == 0 {
                         out.push(Action::Bleeding {
                             name: p.name.clone(),
                             seconds: d.left.div_ceil(20),
@@ -809,5 +809,30 @@ mod tests {
         let c = Config::from_json(&json!({"bleed_seconds": 30, "revive_range": "far"}));
         assert_eq!(c.bleed_ticks, 600);
         assert_eq!(c.revive_range, Config::default().revive_range);
+    }
+
+    #[test]
+    fn bleeding_action_ticks_cleanly_once_per_second() {
+        let mut c = quick();
+        c.bleed_ticks = 100;
+        let mut r = Revive::new(c);
+        let alex = player(1, "Alex", [0.0; 3]);
+        let steve = player(2, "Steve", [50.0, 0.0, 0.0]); // far away
+        r.tick(&[alex.clone(), steve.clone()]);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        r.tick(&[alex.clone(), steve.clone()]);
+
+        let mut bleeding_count = 0;
+        // Run 40 ticks (2 seconds)
+        for _ in 0..40 {
+            let actions = r.tick(&[alex.clone(), steve.clone()]);
+            for a in actions {
+                if let Action::Bleeding { .. } = a {
+                    bleeding_count += 1;
+                }
+            }
+        }
+        // In 40 ticks, exactly 2 seconds should pass and emit exactly 2 Bleeding actions
+        assert_eq!(bleeding_count, 2);
     }
 }

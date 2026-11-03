@@ -12,7 +12,7 @@ When taking fatal damage, players are knocked down instead of dying instantly, g
 * **40s Pure Bleed-out Timer:** Actionbar countdown with heartbeat sounds and blood particles. Damage while downed is completely absorbed with zero penalty — the timer ONLY ticks down naturally with time.
 * **Totem Support:** Totem of Undying triggers normally first and prevents knockdown.
 * **Reviving:** Approach a downed teammate (≤ 2.5m), stand on the ground, and **hold Shift (sneak)** for 5 seconds.
-* **Hardcore Recovery:** Get back up with only **2 hearts (4 HP)** and trauma debuffs (Darkness, Slowness, Weakness, Hunger). No free regeneration!
+* **Hardcore Recovery:** Get back up with only **2 hearts (4 HP)** and trauma debuffs (Darkness, Slowness, Weakness, Hunger). Includes 2s invulnerability grace, slow falling, water breathing, and a defensive repelling burst against nearby mobs to prevent instant one-taps.
 * **Revive Sickness:** Getting downed again within 2 minutes halves bleed-out time to 20 seconds.
 * **Squad Wipe:** If all players are down or dead, the run ends immediately.
 * **Instant Death:** Void damage and `/kill` bypass knockdown. Single-player deaths are instant.

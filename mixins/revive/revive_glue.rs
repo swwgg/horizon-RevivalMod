@@ -15,7 +15,7 @@ use std::{
 
 pub const ID: &str = "revive";
 pub const NAME: &str = "Revive";
-pub const VERSION: &str = "1.0.2";
+pub const VERSION: &str = "1.0.3";
 
 /// The effects a downed player gets: the only ones taken off again, so a
 /// player keeps their potions, beacon and fire resistance.
@@ -169,7 +169,8 @@ pub fn tick(game: &mut Game<'_>) {
 
     let (players, name_to_uuid) = collect_players(game);
 
-    // Maintain crawling / lying down pose and agonizingly slow wounded crawl for all downed players
+    // Maintain crawling / lying down pose, agonizingly slow wounded crawl,
+    // and lock visual health at 1.0 HP (preventing natural regeneration while downed).
     if let Some(own_uuid) = host_uuid(game) {
         if is_downed(own_uuid) {
             if let Some(p) = game.player.as_mut() {
@@ -178,6 +179,7 @@ pub fn tick(game: &mut Game<'_>) {
                 p.mobility_restricted = true;
                 p.velocity.x *= 0.6;
                 p.velocity.z *= 0.6;
+                let _ = p.set_health(1.0, false);
             }
         }
     }
@@ -191,6 +193,7 @@ pub fn tick(game: &mut Game<'_>) {
                     m.velocity.x *= 0.6;
                     m.velocity.z *= 0.6;
                 }
+                g.health = 1.0;
             }
         }
     }
@@ -287,6 +290,7 @@ pub fn tick(game: &mut Game<'_>) {
             Action::Bleeding { name, seconds } => {
                 let who = target(&name);
                 apply_downed_effects(game, &who);
+                game.native_run_command(&format!("ride {who} dismount"));
                 if let Some(&uuid) = name_to_uuid.get(&name) {
                     game.native_action_bar(
                         uuid,
@@ -345,23 +349,54 @@ pub fn tick(game: &mut Game<'_>) {
                     }
                 }
 
-                // Hardcore "Shock & Trauma" recovery debuffs:
-                // 1. Brief resistance (2s) just to prevent instant frame-1 one-tap
-                game.native_run_command(&format!("effect give {who} resistance 2 0 true"));
-                // 2. Concussion: Darkness for 4s (vision blacking out / waking up)
+                // Hardcore "Shock & Trauma" recovery debuffs + Lifesaving grace:
+                // 1. Invulnerability grace: Resistance V (100% reduction) for 2s to prevent frame-1 one-tap
+                game.native_run_command(&format!("effect give {who} resistance 2 4 true"));
+                // 2. Slow falling for 3s to cancel accumulated fall damage or cliff drops
+                game.native_run_command(&format!("effect give {who} slow_falling 3 0 true"));
+                // 3. Water breathing for 5s to prevent instant drowning if revived underwater
+                game.native_run_command(&format!("effect give {who} water_breathing 5 0 true"));
+                // 4. Fire resistance for 3s to prevent immediate burning if revived near fire/lava
+                game.native_run_command(&format!("effect give {who} fire_resistance 3 0 true"));
+                // 5. Concussion: Darkness for 4s (vision blacking out / waking up)
                 game.native_run_command(&format!("effect give {who} darkness 4 0 true"));
-                // 3. Limping: Slowness I for 15s (injured legs, cannot sprint away)
+                // 6. Limping: Slowness I for 15s (injured legs, cannot sprint away)
                 game.native_run_command(&format!("effect give {who} slowness 15 0 true"));
-                // 4. Trauma: Weakness I for 20s (shaking hands, reduced damage)
+                // 7. Trauma: Weakness I for 20s (shaking hands, reduced damage)
                 game.native_run_command(&format!("effect give {who} weakness 20 0 true"));
-                // 5. Exhaustion: Hunger II for 10s (depletes food, requires eating)
+                // 8. Exhaustion: Hunger II for 10s (depletes food, requires eating)
                 game.native_run_command(&format!("effect give {who} hunger 10 1 true"));
+
+                // Defensive burst on revival: push nearby hostile mobs back and defuse creepers
+                if let Some(&uuid) = name_to_uuid.get(&name) {
+                    if let Some(p) = players.iter().find(|p| p.uuid == uuid) {
+                        let [px, py, pz] = p.pos;
+                        for mob in &mut game.mobs {
+                            if mob.removed || mob.health <= 0.0 {
+                                continue;
+                            }
+                            let dx = mob.position.x - px;
+                            let dy = mob.position.y - py;
+                            let dz = mob.position.z - pz;
+                            let dist_sq = dx * dx + dy * dy + dz * dz;
+                            if dist_sq < 5.0 * 5.0 {
+                                let dist = dist_sq.sqrt().max(0.1);
+                                mob.velocity.x += (dx / dist) * 0.9;
+                                mob.velocity.y = 0.35;
+                                mob.velocity.z += (dz / dist) * 0.9;
+                                mob.needs_sync = true;
+                                mob.swell = 0;
+                            }
+                        }
+                    }
+                }
 
                 game.native_broadcast(Text::literal(format!("[Revive] {by} revived {name}!")));
                 // Totem and levelup celebration sounds & particles
                 game.native_run_command(&format!("execute at {who} run playsound minecraft:item.totem.use player @a ~ ~ ~ 1.0 1.0"));
                 game.native_run_command(&format!("execute at {who} run playsound minecraft:entity.player.levelup player @a ~ ~ ~ 1.0 1.0"));
                 game.native_run_command(&format!("execute at {who} run particle minecraft:totem_of_undying ~ ~1 ~ 0.5 0.8 0.5 0.2 50"));
+                game.native_run_command(&format!("execute at {who} run particle minecraft:sweep_attack ~ ~0.5 ~ 0.5 0.2 0.5 0 6"));
             }
             Action::BledOut { name } => {
                 let who = target(&name);
@@ -399,10 +434,14 @@ fn clear_downed_effects(game: &mut Game<'_>, who: &str) {
 /// Clears target, navigation and aggro from any hostile mobs near downed players,
 /// while ensuring standing teammates in combat range can still fight mobs normally.
 fn deaggro_mobs_from_downed(game: &mut Game<'_>, players: &[PlayerView]) {
-    let downed: Vec<&PlayerView> = players.iter().filter(|p| is_downed(p.uuid)).collect();
+    let current_dim = game.dim.id();
+    let downed: Vec<&PlayerView> = players
+        .iter()
+        .filter(|p| is_downed(p.uuid) && p.dimension == current_dim)
+        .collect();
     let standing: Vec<&PlayerView> = players
         .iter()
-        .filter(|p| !is_downed(p.uuid) && p.mortal())
+        .filter(|p| !is_downed(p.uuid) && p.mortal() && p.dimension == current_dim)
         .collect();
 
     if downed.is_empty() {
