@@ -19,10 +19,6 @@ pub struct Config {
     pub revive_ticks: u32,
     /// How close (blocks, between feet) the teammate must be.
     pub revive_range: f64,
-    /// Ticks of bleeding a hit on a downed player costs, per health point.
-    pub penalty_ticks_per_hp: f32,
-    /// The most ticks a single hit on a downed player can cost.
-    pub penalty_cap_ticks: u32,
     /// Ticks a revived player has Revive Sickness (2 minutes default).
     pub sickness_ticks: u64,
 }
@@ -33,8 +29,6 @@ impl Default for Config {
             bleed_ticks: 40 * 20,
             revive_ticks: 5 * 20,
             revive_range: 2.5,
-            penalty_ticks_per_hp: 5.0,
-            penalty_cap_ticks: 4 * 20,
             sickness_ticks: 120 * 20,
         }
     }
@@ -65,12 +59,6 @@ impl Config {
         if let Some(v) = num("revive_range") {
             c.revive_range = v;
         }
-        if let Some(v) = num("penalty_seconds_per_hp") {
-            c.penalty_ticks_per_hp = (v * 20.0) as f32;
-        }
-        if let Some(v) = num("penalty_cap_seconds") {
-            c.penalty_cap_ticks = ticks(v);
-        }
         if let Some(v) = num("sickness_seconds") {
             c.sickness_ticks = (v * 20.0).round().min(u64::MAX as f64) as u64;
         }
@@ -89,17 +77,6 @@ pub fn after_armor(damage: f32, armor: f32, toughness: f32) -> f32 {
 
 /// Damage types a teammate couldn't save anyone from: they kill as usual.
 pub const UNSAVABLE: [&str; 2] = ["minecraft:out_of_world", "minecraft:generic_kill"];
-
-/// Continuous environmental damage types that shouldn't drain the timer instantly.
-#[allow(dead_code)]
-pub const CONTINUOUS_DAMAGE: [&str; 6] = [
-    "minecraft:in_fire",
-    "minecraft:on_fire",
-    "minecraft:lava",
-    "minecraft:drown",
-    "minecraft:in_wall",
-    "minecraft:freeze",
-];
 
 /// Damage types armour doesn't reduce (vanilla's `#bypasses_armor`).
 pub const ARMOR_IGNORED: [&str; 12] = [
@@ -199,9 +176,6 @@ pub struct Revive {
     armor: HashMap<u128, (f32, f32)>,
     /// Players holding a Totem of Undying.
     totem: HashSet<u128>,
-    /// Last tick a player took a penalty from continuous DoT damage (fire/lava/drown).
-    #[allow(dead_code)]
-    last_dot_penalty: HashMap<u128, u64>,
     /// Expiration tick for Revive Sickness (chain knockout protection).
     sickness: HashMap<u128, u64>,
     /// Players on and present last tick.
@@ -220,6 +194,11 @@ impl Revive {
     /// Whether `uuid` is downed (or about to be).
     pub fn is_downed(&self, uuid: u128) -> bool {
         self.downed.contains_key(&uuid) || self.pending.contains(&uuid)
+    }
+
+    /// All UUIDs currently downed.
+    pub fn downed_uuids(&self) -> Vec<u128> {
+        self.downed.keys().copied().collect()
     }
 
     /// A mortal player other than `uuid` who isn't downed: someone who could
@@ -297,23 +276,25 @@ impl Revive {
                 changed = true;
             }
         }
-        self.present = players.iter().map(|p| p.uuid).collect();
+        self.present.clear();
+        self.present.extend(players.iter().map(|p| p.uuid));
 
-        self.uuid_of = players.iter().map(|p| (p.entity, p.uuid)).collect();
-        self.health = players
-            .iter()
-            .filter(|p| p.mortal())
-            .map(|p| (p.uuid, p.health))
-            .collect();
-        self.armor = players
-            .iter()
-            .map(|p| (p.uuid, (p.armor, p.toughness)))
-            .collect();
-        self.totem = players
-            .iter()
-            .filter(|p| p.has_totem)
-            .map(|p| p.uuid)
-            .collect();
+        self.uuid_of.clear();
+        self.uuid_of.extend(players.iter().map(|p| (p.entity, p.uuid)));
+
+        self.health.clear();
+        self.health.extend(
+            players
+                .iter()
+                .filter(|p| p.mortal())
+                .map(|p| (p.uuid, p.health)),
+        );
+
+        self.armor.clear();
+        self.armor.extend(players.iter().map(|p| (p.uuid, (p.armor, p.toughness))));
+
+        self.totem.clear();
+        self.totem.extend(players.iter().filter(|p| p.has_totem).map(|p| p.uuid));
 
         // Squad Wipe check: if all players on the server are downed or dead, wipe squad.
         // Requires at least 2 players on server to prevent accidental wipes on single-player rejoin/disconnect.
@@ -362,78 +343,80 @@ impl Revive {
             changed = true;
         }
 
-        let mut uuids: Vec<u128> = self.downed.keys().copied().collect();
-        uuids.sort_unstable();
-        for uuid in uuids {
-            let Some(p) = by_uuid.get(&uuid) else {
-                // Away: they keep bleeding, and die when they come back.
-                let d = self.downed.get_mut(&uuid).expect("listed");
-                d.progress = 0;
-                d.left = d.left.saturating_sub(1);
-                if d.left == 0 {
-                    self.downed.remove(&uuid);
-                    self.sickness.remove(&uuid);
-                    self.pending_kill.insert(uuid);
-                    changed = true;
-                }
-                continue;
-            };
-            if !p.mortal() {
-                self.downed.remove(&uuid);
-                self.sickness.remove(&uuid);
-                out.push(Action::Cleared {
-                    name: p.name.clone(),
-                });
-                changed = true;
-                continue;
-            }
-            let reviver = self.reviver(p, players);
-            let config = self.config.clone();
-            let d = self.downed.get_mut(&uuid).expect("listed");
-            match reviver {
-                Some(r) => {
-                    // Help pauses the bleeding.
-                    let old_step = d.progress * 10 / config.revive_ticks.max(1);
-                    d.progress += 1;
-                    if d.progress >= config.revive_ticks {
-                        self.downed.remove(&uuid);
-                        self.sickness.insert(uuid, self.tick + config.sickness_ticks);
-                        out.push(Action::Revived {
-                            name: p.name.clone(),
-                            by: r.name.clone(),
-                        });
-                        changed = true;
-                    } else {
-                        let new_step = d.progress * 10 / config.revive_ticks.max(1);
-                        out.push(Action::Progress {
-                            name: p.name.clone(),
-                            by: r.name.clone(),
-                            percent: d.progress * 100 / config.revive_ticks.max(1),
-                            milestone: new_step > old_step,
-                        });
-                    }
-                }
-                None => {
+        if !self.downed.is_empty() {
+            let mut uuids: Vec<u128> = self.downed.keys().copied().collect();
+            uuids.sort_unstable();
+            for uuid in uuids {
+                let Some(p) = by_uuid.get(&uuid) else {
+                    // Away: they keep bleeding, and die when they come back.
+                    let d = self.downed.get_mut(&uuid).expect("listed");
                     d.progress = 0;
                     d.left = d.left.saturating_sub(1);
                     if d.left == 0 {
                         self.downed.remove(&uuid);
                         self.sickness.remove(&uuid);
-                        out.push(Action::BledOut {
-                            name: p.name.clone(),
-                        });
+                        self.pending_kill.insert(uuid);
                         changed = true;
-                    } else if d.left % 20 == 0 {
-                        out.push(Action::Bleeding {
-                            name: p.name.clone(),
-                            seconds: d.left.div_ceil(20),
-                        });
+                    }
+                    continue;
+                };
+                if !p.mortal() {
+                    self.downed.remove(&uuid);
+                    self.sickness.remove(&uuid);
+                    out.push(Action::Cleared {
+                        name: p.name.clone(),
+                    });
+                    changed = true;
+                    continue;
+                }
+                let reviver = self.reviver(p, players);
+                let config = self.config.clone();
+                let d = self.downed.get_mut(&uuid).expect("listed");
+                match reviver {
+                    Some(r) => {
+                        // Help pauses the bleeding.
+                        let old_step = d.progress * 10 / config.revive_ticks.max(1);
+                        d.progress += 1;
+                        if d.progress >= config.revive_ticks {
+                            self.downed.remove(&uuid);
+                            self.sickness.insert(uuid, self.tick + config.sickness_ticks);
+                            out.push(Action::Revived {
+                                name: p.name.clone(),
+                                by: r.name.clone(),
+                            });
+                            changed = true;
+                        } else {
+                            let new_step = d.progress * 10 / config.revive_ticks.max(1);
+                            out.push(Action::Progress {
+                                name: p.name.clone(),
+                                by: r.name.clone(),
+                                percent: d.progress * 100 / config.revive_ticks.max(1),
+                                milestone: new_step > old_step,
+                            });
+                        }
+                    }
+                    None => {
+                        d.progress = 0;
+                        d.left = d.left.saturating_sub(1);
+                        if d.left == 0 {
+                            self.downed.remove(&uuid);
+                            self.sickness.remove(&uuid);
+                            out.push(Action::BledOut {
+                                name: p.name.clone(),
+                            });
+                            changed = true;
+                        } else if d.left.is_multiple_of(20) {
+                            out.push(Action::Bleeding {
+                                name: p.name.clone(),
+                                seconds: d.left.div_ceil(20),
+                            });
+                        }
                     }
                 }
             }
         }
         // Keep the saved time left roughly current.
-        if changed || (!self.downed.is_empty() && self.tick % 100 == 0) {
+        if changed || (!self.downed.is_empty() && self.tick.is_multiple_of(100)) {
             out.push(Action::Save);
         }
         out
@@ -506,7 +489,7 @@ impl Revive {
     }
 }
 
-fn distance_sq(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub fn distance_sq(a: [f64; 3], b: [f64; 3]) -> f64 {
     (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
 }
 
@@ -536,8 +519,6 @@ mod tests {
             bleed_ticks: 40,
             revive_ticks: 10,
             revive_range: 2.0,
-            penalty_ticks_per_hp: 1.0,
-            penalty_cap_ticks: 1000,
             sickness_ticks: 100,
         }
     }
@@ -793,21 +774,6 @@ mod tests {
         assert!(!r.on_damage(101, "minecraft:player", "minecraft:mob_attack", 24.0));
         // Falls ignore armour.
         assert!(r.on_damage(101, "minecraft:player", "minecraft:fall", 15.0));
-    }
-
-    #[test]
-    fn one_hit_costs_at_most_the_cap() {
-        let c = quick();
-        let mut r = Revive::new(c);
-        let players = [player(1, "Alex", [0.0; 3]), player(2, "Steve", [50.0, 0.0, 0.0])];
-        r.tick(&players);
-        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
-        r.tick(&players);
-        let left_before = r.downed.get(&1).unwrap().left;
-        assert!(r.on_damage(101, "minecraft:player", "minecraft:explosion", 100.0));
-        assert_eq!(r.downed.get(&1).unwrap().left, left_before);
-        assert!(!r.tick(&players).contains(&Action::BledOut { name: "Alex".into() }));
-        assert!(r.is_downed(1));
     }
 
     #[test]

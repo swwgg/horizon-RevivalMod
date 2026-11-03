@@ -88,8 +88,14 @@ fn save(state: &ModState) {
 /// A UUID as commands take it (`8-4-4-4-12`): safe to put in a command
 /// whatever the player's name.
 fn selector(uuid: u128) -> String {
-    let h = format!("{uuid:032x}");
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (uuid >> 96) as u32,
+        ((uuid >> 80) & 0xffff) as u16,
+        ((uuid >> 64) & 0xffff) as u16,
+        ((uuid >> 48) & 0xffff) as u16,
+        (uuid & 0xffffffffffff) as u64,
+    )
 }
 
 /// The damage hook: called from `native_living_incoming_damage` (which has no `&mut Game`).
@@ -163,43 +169,10 @@ pub fn tick(game: &mut Game<'_>) {
         return;
     };
 
-    let (players, name_to_uuid) = collect_players(game);
+    let players = collect_players(game);
 
-    // Maintain crawling / lying down pose, agonizingly slow wounded crawl,
-    // and lock visual health at 1.0 HP (preventing natural regeneration while downed).
-    if let Some(own_uuid) = host_uuid(game) {
-        if is_downed(own_uuid) {
-            if let Some(p) = game.player.as_mut() {
-                let _ = p.set_pose(horizon_client::pose::Pose::Swimming);
-                p.jumping = false;
-                p.mobility_restricted = true;
-                p.velocity.x *= 0.6;
-                p.velocity.z *= 0.6;
-                let _ = p.set_health(1.0, false);
-            }
-        }
-    }
-    if let Some(host) = &mut game.lan {
-        for g in &mut host.hub.guests {
-            if is_downed(g.uuid) {
-                if let Some(m) = g.motion.as_mut() {
-                    m.pose = horizon_client::pose::Pose::Swimming;
-                    m.jumping = false;
-                    m.mobility_restricted = true;
-                    m.velocity.x *= 0.6;
-                    m.velocity.z *= 0.6;
-                }
-                g.health = 1.0;
-            }
-        }
-    }
-
-    // Keep hostile mobs from aggroing on any downed player
-    deaggro_mobs_from_downed(game, &players);
-
-    // The rules run under the lock; the commands after it, so a hook a
-    // command sets off (damage, a player's) never waits on it.
-    let actions = {
+    // The rules run under the lock once; commands and effects after it.
+    let (actions, downed_uuids) = {
         let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
         if guard.as_ref().is_none_or(|s| s.dir != dir) {
             if let Some(old) = guard.as_ref() {
@@ -214,10 +187,45 @@ pub fn tick(game: &mut Game<'_>) {
         if actions.contains(&Action::Save) {
             save(state);
         }
-        actions
+        let downed_uuids = state.revive.downed_uuids();
+        (actions, downed_uuids)
     };
 
-    let target = |name: &str| name_to_uuid.get(name).map_or_else(|| name.to_owned(), |&u| selector(u));
+    // If anyone is downed, enforce crawl pose, speed restrictions, and 1.0 HP lock
+    if !downed_uuids.is_empty() {
+        if let Some(own_uuid) = host_uuid(game) {
+            if downed_uuids.contains(&own_uuid) {
+                if let Some(p) = game.player.as_mut() {
+                    let _ = p.set_pose(horizon_client::pose::Pose::Swimming);
+                    p.jumping = false;
+                    p.mobility_restricted = true;
+                    p.velocity.x *= 0.6;
+                    p.velocity.z *= 0.6;
+                    let _ = p.set_health(1.0, false);
+                }
+            }
+        }
+        if let Some(host) = &mut game.lan {
+            for g in &mut host.hub.guests {
+                if downed_uuids.contains(&g.uuid) {
+                    if let Some(m) = g.motion.as_mut() {
+                        m.pose = horizon_client::pose::Pose::Swimming;
+                        m.jumping = false;
+                        m.mobility_restricted = true;
+                        m.velocity.x *= 0.6;
+                        m.velocity.z *= 0.6;
+                    }
+                    g.health = 1.0;
+                }
+            }
+        }
+
+        // Keep hostile mobs from aggroing on any downed player
+        deaggro_mobs_from_downed(game, &players, &downed_uuids);
+    }
+
+    let find_player = |name: &str| players.iter().find(|p| p.name == name);
+    let target = |name: &str| find_player(name).map_or_else(|| name.to_owned(), |p| selector(p.uuid));
 
     for action in actions {
         match action {
@@ -236,7 +244,8 @@ pub fn tick(game: &mut Game<'_>) {
                 }
 
                 // Set visual health to 1.0 (half heart)
-                if let Some(&uuid) = name_to_uuid.get(&name) {
+                if let Some(p) = find_player(&name) {
+                    let uuid = p.uuid;
                     if let Some(own_uuid) = host_uuid(game) {
                         if uuid == own_uuid {
                             if let Some(p) = game.player.as_mut() {
@@ -252,25 +261,23 @@ pub fn tick(game: &mut Game<'_>) {
                 }
 
                 // Shockwave on knockdown: repel nearby mobs and defuse creeper fuses
-                if let Some(&uuid) = name_to_uuid.get(&name) {
-                    if let Some(p) = players.iter().find(|p| p.uuid == uuid) {
-                        let [px, py, pz] = p.pos;
-                        for mob in &mut game.mobs {
-                            if mob.removed || mob.health <= 0.0 {
-                                continue;
-                            }
-                            let dx = mob.position.x - px;
-                            let dy = mob.position.y - py;
-                            let dz = mob.position.z - pz;
-                            let dist_sq = dx * dx + dy * dy + dz * dz;
-                            if dist_sq < 4.5 * 4.5 {
-                                let dist = dist_sq.sqrt().max(0.1);
-                                mob.velocity.x += (dx / dist) * 0.8;
-                                mob.velocity.y = 0.35;
-                                mob.velocity.z += (dz / dist) * 0.8;
-                                mob.needs_sync = true;
-                                mob.swell = 0;
-                            }
+                if let Some(p) = find_player(&name) {
+                    let [px, py, pz] = p.pos;
+                    for mob in &mut game.mobs {
+                        if mob.removed || mob.health <= 0.0 {
+                            continue;
+                        }
+                        let dx = mob.position.x - px;
+                        let dy = mob.position.y - py;
+                        let dz = mob.position.z - pz;
+                        let dist_sq = dx * dx + dy * dy + dz * dz;
+                        if dist_sq < 4.5 * 4.5 {
+                            let dist = dist_sq.sqrt().max(0.1);
+                            mob.velocity.x += (dx / dist) * 0.8;
+                            mob.velocity.y = 0.35;
+                            mob.velocity.z += (dz / dist) * 0.8;
+                            mob.needs_sync = true;
+                            mob.swell = 0;
                         }
                     }
                 }
@@ -287,9 +294,9 @@ pub fn tick(game: &mut Game<'_>) {
                 let who = target(&name);
                 apply_downed_effects(game, &who);
                 game.native_run_command(&format!("ride {who} dismount"));
-                if let Some(&uuid) = name_to_uuid.get(&name) {
+                if let Some(p) = find_player(&name) {
                     game.native_action_bar(
-                        uuid,
+                        p.uuid,
                         Text::literal(format!("§cBleeding out! Time left: {seconds}s")),
                     );
                 }
@@ -304,23 +311,22 @@ pub fn tick(game: &mut Game<'_>) {
             }
             Action::Progress { name, by, percent, milestone } => {
                 let who = target(&name);
-                apply_downed_effects(game, &who);
-                if let Some(&uuid) = name_to_uuid.get(&name) {
+                if milestone {
+                    apply_downed_effects(game, &who);
+                    let pitch = 0.5 + (percent as f32 / 100.0) * 0.5;
+                    game.native_run_command(&format!("execute at {who} run playsound minecraft:block.note_block.chime player @a ~ ~ ~ 0.6 {pitch:.2}"));
+                }
+                if let Some(p) = find_player(&name) {
                     game.native_action_bar(
-                        uuid,
+                        p.uuid,
                         Text::literal(format!("§eBeing revived by {by}... {percent}%")),
                     );
                 }
-                if let Some(&uuid) = name_to_uuid.get(&by) {
+                if let Some(p) = find_player(&by) {
                     game.native_action_bar(
-                        uuid,
+                        p.uuid,
                         Text::literal(format!("§aReviving {name}... {percent}%")),
                     );
-                }
-                // Rising chime sound once every 10% milestone
-                if milestone {
-                    let pitch = 0.5 + (percent as f32 / 100.0) * 0.5;
-                    game.native_run_command(&format!("execute at {who} run playsound minecraft:block.note_block.chime player @a ~ ~ ~ 0.6 {pitch:.2}"));
                 }
                 // Happy villager / heart sparkles
                 game.native_run_command(&format!("execute at {who} run particle minecraft:happy_villager ~ ~0.8 ~ 0.4 0.4 0.4 0 6"));
@@ -330,7 +336,8 @@ pub fn tick(game: &mut Game<'_>) {
                 clear_downed_effects(game, &who);
 
                 // Set health to 4.0 HP (2 hearts) - hardcore recovery
-                if let Some(&uuid) = name_to_uuid.get(&name) {
+                if let Some(p) = find_player(&name) {
+                    let uuid = p.uuid;
                     if let Some(own_uuid) = host_uuid(game) {
                         if uuid == own_uuid {
                             if let Some(p) = game.player.as_mut() {
@@ -364,28 +371,34 @@ pub fn tick(game: &mut Game<'_>) {
                 game.native_run_command(&format!("effect give {who} hunger 10 1 true"));
 
                 // Defensive burst on revival: push nearby hostile mobs back and defuse creepers
-                if let Some(&uuid) = name_to_uuid.get(&name) {
-                    if let Some(p) = players.iter().find(|p| p.uuid == uuid) {
-                        let [px, py, pz] = p.pos;
-                        for mob in &mut game.mobs {
-                            if mob.removed || mob.health <= 0.0 {
-                                continue;
-                            }
-                            let dx = mob.position.x - px;
-                            let dy = mob.position.y - py;
-                            let dz = mob.position.z - pz;
-                            let dist_sq = dx * dx + dy * dy + dz * dz;
-                            if dist_sq < 5.0 * 5.0 {
-                                let dist = dist_sq.sqrt().max(0.1);
-                                mob.velocity.x += (dx / dist) * 0.9;
-                                mob.velocity.y = 0.35;
-                                mob.velocity.z += (dz / dist) * 0.9;
-                                mob.needs_sync = true;
-                                mob.swell = 0;
-                            }
+                if let Some(p) = find_player(&name) {
+                    let [px, py, pz] = p.pos;
+                    for mob in &mut game.mobs {
+                        if mob.removed || mob.health <= 0.0 {
+                            continue;
+                        }
+                        let dx = mob.position.x - px;
+                        let dy = mob.position.y - py;
+                        let dz = mob.position.z - pz;
+                        let dist_sq = dx * dx + dy * dy + dz * dz;
+                        if dist_sq < 5.0 * 5.0 {
+                            let dist = dist_sq.sqrt().max(0.1);
+                            mob.velocity.x += (dx / dist) * 0.9;
+                            mob.velocity.y = 0.35;
+                            mob.velocity.z += (dz / dist) * 0.9;
+                            mob.needs_sync = true;
+                            mob.swell = 0;
                         }
                     }
                 }
+
+                game.native_broadcast(Text::literal(format!("[Revive] {by} revived {name}!")));
+                // Totem and levelup celebration sounds & particles
+                game.native_run_command(&format!("execute at {who} run playsound minecraft:item.totem.use player @a ~ ~ ~ 1.0 1.0"));
+                game.native_run_command(&format!("execute at {who} run playsound minecraft:entity.player.levelup player @a ~ ~ ~ 1.0 1.0"));
+                game.native_run_command(&format!("execute at {who} run particle minecraft:totem_of_undying ~ ~1 ~ 0.5 0.8 0.5 0.2 50"));
+                game.native_run_command(&format!("execute at {who} run particle minecraft:sweep_attack ~ ~0.5 ~ 0.5 0.2 0.5 0 6"));
+            }
 
                 game.native_broadcast(Text::literal(format!("[Revive] {by} revived {name}!")));
                 // Totem and levelup celebration sounds & particles
@@ -429,20 +442,22 @@ fn clear_downed_effects(game: &mut Game<'_>, who: &str) {
 
 /// Clears target, navigation and aggro from any hostile mobs near downed players,
 /// while ensuring standing teammates in combat range can still fight mobs normally.
-fn deaggro_mobs_from_downed(game: &mut Game<'_>, players: &[PlayerView]) {
+fn deaggro_mobs_from_downed(game: &mut Game<'_>, players: &[PlayerView], downed_uuids: &[u128]) {
+    if downed_uuids.is_empty() {
+        return;
+    }
     let current_dim = game.dim.id();
     let downed: Vec<&PlayerView> = players
         .iter()
-        .filter(|p| is_downed(p.uuid) && p.dimension == current_dim)
+        .filter(|p| downed_uuids.contains(&p.uuid) && p.dimension == current_dim)
         .collect();
-    let standing: Vec<&PlayerView> = players
-        .iter()
-        .filter(|p| !is_downed(p.uuid) && p.mortal() && p.dimension == current_dim)
-        .collect();
-
     if downed.is_empty() {
         return;
     }
+    let standing: Vec<&PlayerView> = players
+        .iter()
+        .filter(|p| !downed_uuids.contains(&p.uuid) && p.mortal() && p.dimension == current_dim)
+        .collect();
 
     for mob in &mut game.mobs {
         if mob.removed || mob.health <= 0.0 {
@@ -451,42 +466,41 @@ fn deaggro_mobs_from_downed(game: &mut Game<'_>, players: &[PlayerView]) {
 
         let mob_pos = [mob.position.x, mob.position.y, mob.position.z];
 
-        // If an active standing teammate is within combat range (10 blocks),
-        // let the mob fight the teammate normally without clearing AI or targets!
+        // 1. Fast bounding box check against downed players: reject 95% of distant mobs immediately
+        let near_downed = downed.iter().any(|p| {
+            (mob_pos[0] - p.pos[0]).abs() < 16.0
+                && (mob_pos[2] - p.pos[2]).abs() < 16.0
+                && (mob_pos[1] - p.pos[1]).abs() < 16.0
+                && crate::game::revive_rules::distance_sq(mob_pos, p.pos) < 16.0 * 16.0
+        });
+
+        if !near_downed {
+            continue;
+        }
+
+        // 2. Only if near a downed player, check if an active standing teammate is in combat range (< 10 blocks)
         let near_standing_combat = standing.iter().any(|p| {
-            let dx = mob_pos[0] - p.pos[0];
-            let dy = mob_pos[1] - p.pos[1];
-            let dz = mob_pos[2] - p.pos[2];
-            dx * dx + dy * dy + dz * dz < 10.0 * 10.0
+            (mob_pos[0] - p.pos[0]).abs() < 10.0
+                && (mob_pos[2] - p.pos[2]).abs() < 10.0
+                && (mob_pos[1] - p.pos[1]).abs() < 10.0
+                && crate::game::revive_rules::distance_sq(mob_pos, p.pos) < 10.0 * 10.0
         });
 
         if near_standing_combat {
             continue;
         }
 
-        // Otherwise, if the mob is near a downed player (within 16 blocks) and no standing
-        // player is around, clear target so it stops swarming the helpless downed body.
-        let near_downed = downed.iter().any(|p| {
-            let dx = mob_pos[0] - p.pos[0];
-            let dy = mob_pos[1] - p.pos[1];
-            let dz = mob_pos[2] - p.pos[2];
-            dx * dx + dy * dy + dz * dz < 16.0 * 16.0
-        });
-
-        if near_downed {
-            mob.ai.target = None;
-            mob.ai.last_hurt_by = None;
-            mob.ai.aggressive = false;
-            mob.ai.nav.stop();
-            mob.swell = 0;
-        }
+        mob.ai.target = None;
+        mob.ai.last_hurt_by = None;
+        mob.ai.aggressive = false;
+        mob.ai.nav.stop();
+        mob.swell = 0;
     }
 }
 
 /// Gathers the current state of all online players on the server.
-fn collect_players(game: &Game<'_>) -> (Vec<PlayerView>, HashMap<String, u128>) {
+fn collect_players(game: &Game<'_>) -> Vec<PlayerView> {
     let mut players = Vec::new();
-    let mut name_to_uuid = HashMap::new();
     let armor = ARMOR.lock().unwrap_or_else(|e| e.into_inner());
     let worn = |uuid: u128| {
         armor
@@ -517,7 +531,6 @@ fn collect_players(game: &Game<'_>) -> (Vec<PlayerView>, HashMap<String, u128>) 
                 has_totem,
                 on_ground: g.on_ground,
             });
-            name_to_uuid.insert(g.name.clone(), g.uuid);
         }
     }
 
@@ -530,7 +543,7 @@ fn collect_players(game: &Game<'_>) -> (Vec<PlayerView>, HashMap<String, u128>) 
         let entity = game.lan.as_ref().map_or(p.entity_id, |h| h.host_entity);
         let name = game.options.player_name();
 
-        if !name_to_uuid.contains_key(&name) {
+        if !players.iter().any(|p| p.name == name) {
             let sneaking = p.shift_key_down || p.pose == horizon_client::pose::Pose::Crouching;
             let (armor, toughness) = worn(own_uuid);
             let has_totem = game.held().is_some_and(|s| &*s.item == "minecraft:totem_of_undying")
@@ -549,11 +562,10 @@ fn collect_players(game: &Game<'_>) -> (Vec<PlayerView>, HashMap<String, u128>) 
                 has_totem,
                 on_ground: p.ground.on_ground,
             });
-            name_to_uuid.insert(name, own_uuid);
         }
     }
 
-    (players, name_to_uuid)
+    players
 }
 
 /// The world lifecycle hook: writes state on world close.
