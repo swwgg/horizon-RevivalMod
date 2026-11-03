@@ -15,7 +15,7 @@ use std::{
 
 pub const ID: &str = "revive";
 pub const NAME: &str = "Revive";
-pub const VERSION: &str = "1.0.3";
+pub const VERSION: &str = "1.0.4";
 
 /// The effects a downed player gets: the only ones taken off again, so a
 /// player keeps their potions, beacon and fire resistance.
@@ -136,11 +136,7 @@ pub fn acting_is_downed(game: &mut Game<'_>) -> bool {
     let Some(uuid) = acting_uuid(game) else {
         return false;
     };
-    let downed = is_downed(uuid);
-    if downed {
-        game.native_action_bar(uuid, Text::literal("§cYou are down: wait for a teammate!"));
-    }
-    downed
+    is_downed(uuid)
 }
 
 /// The player tick hook: reads the acting player's worn armour.
@@ -225,13 +221,13 @@ pub fn tick(game: &mut Game<'_>) {
 
     for action in actions {
         match action {
-            Action::Down { name, sick } => {
+            Action::Down { name, sick, seconds } => {
                 let who = target(&name);
                 // Dismount from vehicles
                 game.native_run_command(&format!("ride {who} dismount"));
                 if sick {
                     game.native_broadcast(Text::literal(format!(
-                        "[Revive] §c{name} collapsed again from Revive Sickness! Only 20s left!"
+                        "[Revive] §c{name} collapsed again from Revive Sickness! Only {seconds}s left!"
                     )));
                 } else {
                     game.native_broadcast(Text::literal(format!(
@@ -279,9 +275,9 @@ pub fn tick(game: &mut Game<'_>) {
                     }
                 }
 
-                // Blast & bell resonance sound and shockwave particles
+                // Blast & bell resonance sound (volume 3.0 reaches ~48 blocks) and shockwave particles
                 game.native_run_command(&format!("execute at {who} run playsound minecraft:entity.generic.explode player @a ~ ~ ~ 0.7 1.5"));
-                game.native_run_command(&format!("execute at {who} run playsound minecraft:block.bell.resonate player @a ~ ~ ~ 1.5 0.8"));
+                game.native_run_command(&format!("execute at {who} run playsound minecraft:block.bell.resonate player @a ~ ~ ~ 3.0 0.8"));
                 game.native_run_command(&format!("execute at {who} run particle minecraft:sweep_attack ~ ~0.5 ~ 0.5 0.2 0.5 0 6"));
                 game.native_run_command(&format!("execute at {who} run particle minecraft:poof ~ ~0.5 ~ 0.6 0.2 0.6 0.05 12"));
                 game.native_run_command(&format!("execute at {who} run particle minecraft:damage_indicator ~ ~1 ~ 0.5 0.5 0.5 0.1 20"));
@@ -306,7 +302,7 @@ pub fn tick(game: &mut Game<'_>) {
                 // Blood dust particles
                 game.native_run_command(&format!("execute at {who} run particle minecraft:dust 1 0 0 1 ~ ~0.5 ~ 0.3 0.2 0.3 0 4"));
             }
-            Action::Progress { name, by, percent } => {
+            Action::Progress { name, by, percent, milestone } => {
                 let who = target(&name);
                 apply_downed_effects(game, &who);
                 if let Some(&uuid) = name_to_uuid.get(&name) {
@@ -321,8 +317,8 @@ pub fn tick(game: &mut Game<'_>) {
                         Text::literal(format!("§aReviving {name}... {percent}%")),
                     );
                 }
-                // Rising chime sound with percentage
-                if percent % 10 == 0 {
+                // Rising chime sound once every 10% milestone
+                if milestone {
                     let pitch = 0.5 + (percent as f32 / 100.0) * 0.5;
                     game.native_run_command(&format!("execute at {who} run playsound minecraft:block.note_block.chime player @a ~ ~ ~ 0.6 {pitch:.2}"));
                 }

@@ -47,8 +47,6 @@ impl Config {
             "bleed_seconds": self.bleed_ticks as f64 / 20.0,
             "revive_seconds": self.revive_ticks as f64 / 20.0,
             "revive_range": self.revive_range,
-            "penalty_seconds_per_hp": self.penalty_ticks_per_hp as f64 / 20.0,
-            "penalty_cap_seconds": self.penalty_cap_ticks as f64 / 20.0,
             "sickness_seconds": self.sickness_ticks as f64 / 20.0,
         })
     }
@@ -154,9 +152,10 @@ impl PlayerView {
 pub enum Action {
     /// `name` just went down: slow them, tell everyone.
     /// `sick` is true if the player collapsed again during Revive Sickness (shorter timer).
-    Down { name: String, sick: bool },
-    /// `name` is being got up by `by`, `percent` of the way.
-    Progress { name: String, by: String, percent: u32 },
+    /// `seconds` is the total seconds given to bleed out.
+    Down { name: String, sick: bool, seconds: u32 },
+    /// `name` is being got up by `by`, `percent` of the way. `milestone` is true when crossing each 10% step.
+    Progress { name: String, by: String, percent: u32, milestone: bool },
     /// `name` is bleeding, `seconds` left (once a second, when nobody helps).
     Bleeding { name: String, seconds: u32 },
     /// `by` got `name` up.
@@ -316,18 +315,20 @@ impl Revive {
             .map(|p| p.uuid)
             .collect();
 
-        // Squad Wipe check: if no player is left alive and standing, wipe remaining downed players!
+        // Squad Wipe check: if all players on the server are downed or dead, wipe squad.
+        // Requires at least 2 players on server to prevent accidental wipes on single-player rejoin/disconnect.
         let any_capable_helper = players
             .iter()
             .any(|p| p.mortal() && !self.is_downed(p.uuid));
 
-        if !any_capable_helper && (!self.downed.is_empty() || !self.pending.is_empty()) {
+        if players.len() >= 2 && !any_capable_helper && (!self.downed.is_empty() || !self.pending.is_empty()) {
             for uuid in self.downed.keys().copied().chain(self.pending.drain(..)) {
                 if let Some(p) = by_uuid.get(&uuid) {
                     out.push(Action::BledOut { name: p.name.clone() });
                 }
             }
             self.downed.clear();
+            self.sickness.clear();
             out.push(Action::SquadWipe);
             out.push(Action::Save);
             return out;
@@ -356,6 +357,7 @@ impl Revive {
             out.push(Action::Down {
                 name: p.name.clone(),
                 sick,
+                seconds: left.div_ceil(20),
             });
             changed = true;
         }
@@ -370,6 +372,7 @@ impl Revive {
                 d.left = d.left.saturating_sub(1);
                 if d.left == 0 {
                     self.downed.remove(&uuid);
+                    self.sickness.remove(&uuid);
                     self.pending_kill.insert(uuid);
                     changed = true;
                 }
@@ -377,6 +380,7 @@ impl Revive {
             };
             if !p.mortal() {
                 self.downed.remove(&uuid);
+                self.sickness.remove(&uuid);
                 out.push(Action::Cleared {
                     name: p.name.clone(),
                 });
@@ -389,6 +393,7 @@ impl Revive {
             match reviver {
                 Some(r) => {
                     // Help pauses the bleeding.
+                    let old_step = d.progress * 10 / config.revive_ticks.max(1);
                     d.progress += 1;
                     if d.progress >= config.revive_ticks {
                         self.downed.remove(&uuid);
@@ -399,10 +404,12 @@ impl Revive {
                         });
                         changed = true;
                     } else {
+                        let new_step = d.progress * 10 / config.revive_ticks.max(1);
                         out.push(Action::Progress {
                             name: p.name.clone(),
                             by: r.name.clone(),
                             percent: d.progress * 100 / config.revive_ticks.max(1),
+                            milestone: new_step > old_step,
                         });
                     }
                 }
@@ -411,6 +418,7 @@ impl Revive {
                     d.left = d.left.saturating_sub(1);
                     if d.left == 0 {
                         self.downed.remove(&uuid);
+                        self.sickness.remove(&uuid);
                         out.push(Action::BledOut {
                             name: p.name.clone(),
                         });
@@ -542,7 +550,7 @@ mod tests {
         assert!(!r.on_damage(101, "minecraft:player", "minecraft:mob_attack", 5.0));
         assert!(r.on_damage(101, "minecraft:player", "minecraft:mob_attack", 15.0));
         let out = r.tick(&players);
-        assert!(out.contains(&Action::Down { name: "Alex".into(), sick: false }));
+        assert!(out.contains(&Action::Down { name: "Alex".into(), sick: false, seconds: 2 }));
         assert!(r.is_downed(1));
         // Hits on a downed player are canceled.
         assert!(r.on_damage(101, "minecraft:player", "minecraft:lava", 4.0));
@@ -622,7 +630,7 @@ mod tests {
         r.tick(&players);
         r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
         let out = r.tick(&players);
-        assert!(out.contains(&Action::Down { name: "Alex".into(), sick: true }));
+        assert!(out.contains(&Action::Down { name: "Alex".into(), sick: true, seconds: 1 }));
         // Sickness reduces bleed time (in quick() config: max(40/3, 200) = 200)
         assert!(r.downed.get(&1).unwrap().left <= 200);
     }
@@ -834,5 +842,63 @@ mod tests {
         }
         // In 40 ticks, exactly 2 seconds should pass and emit exactly 2 Bleeding actions
         assert_eq!(bleeding_count, 2);
+    }
+
+    #[test]
+    fn disconnect_does_not_squad_wipe() {
+        let mut r = Revive::new(quick());
+        let alex = player(1, "Alex", [0.0; 3]);
+        let steve = player(2, "Steve", [1.0, 0.0, 0.0]);
+        r.tick(&[alex.clone(), steve.clone()]);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        r.tick(&[alex.clone(), steve.clone()]);
+        assert!(r.is_downed(1));
+
+        // Steve disconnects (e.g. crash/lag): only Alex is on the server now
+        let out = r.tick(&[alex.clone()]);
+        // Alex MUST NOT be squad wiped immediately!
+        assert!(!out.contains(&Action::SquadWipe));
+        assert!(r.is_downed(1));
+
+        // Steve reconnects and can save Alex
+        let mut steve_reconnected = steve.clone();
+        steve_reconnected.sneaking = true;
+        let out = r.tick(&[alex.clone(), steve_reconnected]);
+        assert!(!out.contains(&Action::SquadWipe));
+        assert!(out.iter().any(|a| matches!(a, Action::Progress { .. })));
+    }
+
+    #[test]
+    fn sickness_cleared_on_death() {
+        let mut r = Revive::new(quick());
+        let mut alex = player(1, "Alex", [0.0; 3]);
+        let mut steve = player(2, "Steve", [1.0, 0.0, 0.0]);
+        steve.sneaking = true;
+        r.tick(&[alex.clone(), steve.clone()]);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        r.tick(&[alex.clone(), steve.clone()]);
+
+        // Revive Alex
+        for _ in 0..10 {
+            r.tick(&[alex.clone(), steve.clone()]);
+        }
+        assert!(!r.is_downed(1));
+        assert!(r.sickness.contains_key(&1));
+
+        // Alex takes lethal damage again (with sickness) and bleeds out
+        alex.health = 20.0;
+        steve.sneaking = false;
+        r.tick(&[alex.clone(), steve.clone()]);
+        r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
+        r.tick(&[alex.clone(), steve.clone()]);
+        assert!(r.is_downed(1));
+
+        // Let bleed timer run down completely
+        for _ in 0..25 {
+            r.tick(&[alex.clone(), steve.clone()]);
+        }
+        assert!(!r.is_downed(1));
+        // Sickness must be cleared upon death so fresh respawn isn't penalized!
+        assert!(!r.sickness.contains_key(&1));
     }
 }
