@@ -15,16 +15,15 @@ use std::{
 
 pub const ID: &str = "revive";
 pub const NAME: &str = "Revive";
-pub const VERSION: &str = "1.0.0";
+pub const VERSION: &str = "1.0.1";
 
 /// The effects a downed player gets: the only ones taken off again, so a
 /// player keeps their potions, beacon and fire resistance.
-const DOWNED_EFFECTS: [(&str, u8); 5] = [
+const DOWNED_EFFECTS: [(&str, u8); 4] = [
     ("slowness", 5),
     ("weakness", 255),
     ("mining_fatigue", 255),
     ("glowing", 0),
-    ("invisibility", 0),
 ];
 
 pub struct ModState {
@@ -195,6 +194,9 @@ pub fn tick(game: &mut Game<'_>) {
             }
         }
     }
+
+    // Keep hostile mobs from aggroing on any downed player
+    deaggro_mobs_from_downed(game, &players);
 
     // The rules run under the lock; the commands after it, so a hook a
     // command sets off (damage, a player's) never waits on it.
@@ -391,6 +393,41 @@ fn apply_downed_effects(game: &mut Game<'_>, who: &str) {
 fn clear_downed_effects(game: &mut Game<'_>, who: &str) {
     for (effect, _) in DOWNED_EFFECTS {
         game.native_run_command(&format!("effect clear {who} {effect}"));
+    }
+}
+
+/// Clears target, navigation and aggro from any hostile mobs near downed players,
+/// so they ignore downed players and focus on standing players or wander.
+fn deaggro_mobs_from_downed(game: &mut Game<'_>, players: &[PlayerView]) {
+    let downed_positions: Vec<[f64; 3]> = players
+        .iter()
+        .filter(|p| is_downed(p.uuid))
+        .map(|p| p.pos)
+        .collect();
+
+    if downed_positions.is_empty() {
+        return;
+    }
+
+    for mob in &mut game.mobs {
+        if mob.removed || mob.health <= 0.0 {
+            continue;
+        }
+
+        let near_downed = downed_positions.iter().any(|&[px, py, pz]| {
+            let dx = mob.position.x - px;
+            let dy = mob.position.y - py;
+            let dz = mob.position.z - pz;
+            dx * dx + dy * dy + dz * dz < 20.0 * 20.0
+        });
+
+        if near_downed {
+            mob.ai.target = None;
+            mob.ai.last_hurt_by = None;
+            mob.ai.aggressive = false;
+            mob.ai.nav.stop();
+            mob.swell = 0;
+        }
     }
 }
 

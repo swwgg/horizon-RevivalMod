@@ -201,6 +201,7 @@ pub struct Revive {
     /// Players holding a Totem of Undying.
     totem: HashSet<u128>,
     /// Last tick a player took a penalty from continuous DoT damage (fire/lava/drown).
+    #[allow(dead_code)]
     last_dot_penalty: HashMap<u128, u64>,
     /// Expiration tick for Revive Sickness (chain knockout protection).
     sickness: HashMap<u128, u64>,
@@ -246,19 +247,9 @@ impl Revive {
             return false;
         }
         let amount = if amount.is_finite() { amount.max(0.0) } else { f32::MAX };
-        if let Some(d) = self.downed.get_mut(&uuid) {
-            // 20-tick (1s) cooldown between penalties (i-frames) so mobs/fire cannot shred the timer instantly.
-            if let Some(&last) = self.last_dot_penalty.get(&uuid) {
-                if self.tick.saturating_sub(last) < 20 {
-                    return true;
-                }
-            }
-            self.last_dot_penalty.insert(uuid, self.tick);
-
-            // Hits on a downed player shorten their time instead.
-            let penalty = (amount * self.config.penalty_ticks_per_hp)
-                .min(self.config.penalty_cap_ticks as f32) as u32;
-            d.left = d.left.saturating_sub(penalty);
+        if self.downed.contains_key(&uuid) {
+            // Damage while downed is completely canceled without timer penalties.
+            // The bleed timer only decreases naturally with time (1 second per second).
             return true;
         }
         if self.pending.contains(&uuid) {
@@ -637,20 +628,19 @@ mod tests {
     }
 
     #[test]
-    fn continuous_damage_cooldown_works() {
+    fn damage_while_downed_is_canceled_without_penalty() {
         let mut r = Revive::new(quick());
         let players = [player(1, "Alex", [0.0; 3]), player(2, "Steve", [10.0, 0.0, 0.0])];
         r.tick(&players);
         r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
         r.tick(&players);
         let initial_left = r.downed.get(&1).unwrap().left;
-        // First fire hit takes penalty (4 hp = 4 ticks penalty in quick)
+        // Fire hit is canceled and does NOT reduce the timer
         assert!(r.on_damage(101, "minecraft:player", "minecraft:on_fire", 4.0));
-        let after_first = r.downed.get(&1).unwrap().left;
-        assert_eq!(after_first, initial_left - 4);
-        // Immediate second fire hit within same tick should NOT penalize again
-        assert!(r.on_damage(101, "minecraft:player", "minecraft:on_fire", 4.0));
-        assert_eq!(r.downed.get(&1).unwrap().left, after_first);
+        assert_eq!(r.downed.get(&1).unwrap().left, initial_left);
+        // Mob hit is canceled and does NOT reduce the timer
+        assert!(r.on_damage(101, "minecraft:player", "minecraft:mob_attack", 10.0));
+        assert_eq!(r.downed.get(&1).unwrap().left, initial_left);
     }
 
     #[test]
@@ -729,14 +719,16 @@ mod tests {
     }
 
     #[test]
-    fn hits_while_down_shorten_the_time() {
+    fn hits_while_down_do_not_shorten_time() {
         let mut r = Revive::new(quick());
         let players = [player(1, "Alex", [0.0; 3]), player(2, "Steve", [50.0, 0.0, 0.0])];
         r.tick(&players);
         r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
         r.tick(&players);
-        r.on_damage(101, "minecraft:player", "minecraft:explosion", 100.0);
-        assert!(r.tick(&players).contains(&Action::BledOut { name: "Alex".into() }));
+        let left_before = r.downed.get(&1).unwrap().left;
+        assert!(r.on_damage(101, "minecraft:player", "minecraft:explosion", 100.0));
+        assert_eq!(r.downed.get(&1).unwrap().left, left_before);
+        assert!(r.is_downed(1));
     }
 
     #[test]
@@ -797,14 +789,15 @@ mod tests {
 
     #[test]
     fn one_hit_costs_at_most_the_cap() {
-        let mut c = quick();
-        c.penalty_cap_ticks = 5;
+        let c = quick();
         let mut r = Revive::new(c);
         let players = [player(1, "Alex", [0.0; 3]), player(2, "Steve", [50.0, 0.0, 0.0])];
         r.tick(&players);
         r.on_damage(101, "minecraft:player", "minecraft:fall", 25.0);
         r.tick(&players);
-        r.on_damage(101, "minecraft:player", "minecraft:explosion", 100.0);
+        let left_before = r.downed.get(&1).unwrap().left;
+        assert!(r.on_damage(101, "minecraft:player", "minecraft:explosion", 100.0));
+        assert_eq!(r.downed.get(&1).unwrap().left, left_before);
         assert!(!r.tick(&players).contains(&Action::BledOut { name: "Alex".into() }));
         assert!(r.is_downed(1));
     }
